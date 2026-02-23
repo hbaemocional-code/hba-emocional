@@ -1,0 +1,5 @@
+flask
+numpy
+neurokit2
+pandas
+scipy
