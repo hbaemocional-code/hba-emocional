@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>HBA Emocional - Fase 1 (Datos)</title>
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-dot"></div>
+      <div>
+        <div class="brand-title">HBA Emocional</div>
+        <div class="brand-subtitle">Recolección de HRV • Fase 1 (Datos)</div>
+      </div>
+    </div>
+
+    <div class="status-pill" id="statusPill">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Listo</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <h2>Configuración de Registro</h2>
+
+      <div class="grid-2">
+        <div class="field">
+          <label>ID Alumno</label>
+          <input id="studentId" type="text" placeholder="Ej: A-1029" />
+        </div>
+        <div class="field">
+          <label>Edad</label>
+          <input id="age" type="number" min="0" placeholder="Ej: 52" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Comorbilidades</label>
+        <input id="comorbidities" type="text" placeholder="Ej: HTA, DM2, EPOC" />
+      </div>
+
+      <div class="grid-2">
+        <div class="field">
+          <label>Sensor</label>
+          <select id="sensorType">
+            <option value="camera_ppg">Cámara (PPG)</option>
+            <option value="polar_h10">Polar H10 (BLE)</option>
+          </select>
+          <div class="hint">
+            Polar H10 requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost.
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Duración</label>
+          <div class="segmented">
+            <button class="seg-btn active" data-min="3" id="dur3">3 minutos</button>
+            <button class="seg-btn" data-min="5" id="dur5">5 minutos</button>
+          </div>
+          <div class="hint">5 min recomendado para espectral (LF/HF) más estable.</div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn primary" id="btnStart">Iniciar Medición</button>
+        <button class="btn" id="btnStop" disabled>Detener</button>
+        <button class="btn success" id="btnSave" disabled>Guardar Resultado</button>
+      </div>
+
+      <div class="note">
+        <label>Notas (opcional)</label>
+        <input id="notes" type="text" placeholder="Ej: descanso 2 min previo, medicación, etc." />
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Señal en Tiempo Real</h2>
+        <div class="mini">
+          <span class="chip" id="chipSensor">Sensor: Cámara (PPG)</span>
+          <span class="chip" id="chipTimer">00:00</span>
+        </div>
+      </div>
+
+      <div class="chart-wrap">
+        <canvas id="signalChart"></canvas>
+      </div>
+
+      <video id="video" playsinline autoplay muted class="hidden"></video>
+      <canvas id="frameCanvas" class="hidden"></canvas>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Data Details</h2>
+        <div class="hint" id="freqHint"></div>
+      </div>
+
+      <div class="cards" id="cards"></div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div>© HBA Emocional • Fase 1</div>
+    <div class="footer-hint">Uso científico / rehabilitación. No diagnóstico.</div>
+  </footer>
+
+  <script src="/static/js/main.js"></script>
+</body>
+</html>
