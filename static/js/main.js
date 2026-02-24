@@ -13,13 +13,22 @@ let frameCtx = null;
 
 let ppgSamples = [];
 let ppgTimestamps = [];
-let targetFps = 45; // mejor 45 para PPG
+let targetFps = 45;
 let cameraLoopHandle = null;
 
 // Polar H10 BLE
-let bleDevice = null;
-let bleChar = null;
-let rrIntervalsMs = [];
+let polarDevice = null;
+let polarChar = null;
+let polarRrIntervalsMs = [];
+let polarDeviceName = "";
+
+// Garmin HRM BLE
+let garminDevice = null;
+let garminChar = null;
+let garminRrIntervalsMs = [];
+let garminDeviceName = "";
+
+// Resultado
 let lastMetrics = null;
 
 // Chart.js
@@ -63,7 +72,9 @@ function setTimerText(){
 
 function setSensorChip(){
   const chip = document.getElementById("chipSensor");
-  chip.textContent = sensorType === "polar_h10" ? "Sensor: Polar H10 (BLE)" : "Sensor: Cámara (PPG)";
+  if(sensorType === "polar_h10") chip.textContent = "Sensor: Polar H10 (BLE)";
+  else if(sensorType === "garmin_hrm") chip.textContent = "Sensor: Garmin Banda Pecho (BLE)";
+  else chip.textContent = "Sensor: Cámara (PPG)";
 }
 
 function enableControls(){
@@ -131,9 +142,6 @@ function setupSensorSelector(){
   });
 }
 
-/**
- * Helpers de UI para cards
- */
 function _toNumber(v){
   if (typeof v === "number") return v;
   const n = Number(v);
@@ -179,33 +187,19 @@ function buildCards(metrics){
     return;
   }
 
-  // =========================
-  // BLOQUE 1: “Vitals” (nuevo)
-  // =========================
-  // HR mean/min/max + HRV score + respiración estimada
+  // Vitals
   const hrMean = _toNumber(metrics.hr_mean_bpm);
   const hrMin  = _toNumber(metrics.hr_min_bpm);
   const hrMax  = _toNumber(metrics.hr_max_bpm);
-  const hrvScore = _toNumber(metrics.hrv_score);
   const respRpm = _toNumber(metrics.resp_rate_rpm);
 
-  // HRV score tone (heurístico)
-  let hrvTone = "";
-  if(Number.isFinite(hrvScore)){
-    if(hrvScore >= 70) hrvTone = "good";
-    else if(hrvScore >= 40) hrvTone = "warn";
-    else hrvTone = "bad";
-  }
+  // HRV score: solo Polar (backend manda null en Garmin/PPG)
+  const hrvScore = _toNumber(metrics.hrv_score);
 
-  // Resp rate tone (adulto reposo aproximado 10–20 rpm)
-  let respTone = "";
-  if(Number.isFinite(respRpm)){
-    if(respRpm >= 10 && respRpm <= 20) respTone = "good";
-    else if((respRpm >= 8 && respRpm < 10) || (respRpm > 20 && respRpm <= 24)) respTone = "warn";
-    else respTone = "bad";
-  }
+  // ppg quality solo cámara
+  const ppgQuality = _toNumber(metrics.ppg_quality);
+  const ppgValid = metrics.ppg_valid;
 
-  // HR tone (solo para visual, no diagnóstico)
   let hrTone = "";
   if(Number.isFinite(hrMean)){
     if(hrMean >= 50 && hrMean <= 90) hrTone = "good";
@@ -213,16 +207,49 @@ function buildCards(metrics){
     else hrTone = "bad";
   }
 
+  let respTone = "";
+  if(Number.isFinite(respRpm)){
+    if(respRpm >= 10 && respRpm <= 20) respTone = "good";
+    else if((respRpm >= 8 && respRpm < 10) || (respRpm > 20 && respRpm <= 24)) respTone = "warn";
+    else respTone = "bad";
+  }
+
+  let scoreTone = "";
+  if(Number.isFinite(hrvScore)){
+    if(hrvScore >= 70) scoreTone = "good";
+    else if(hrvScore >= 40) scoreTone = "warn";
+    else scoreTone = "bad";
+  }
+
   _addCard(cards, { k: "FC Media", v: _formatNumber(hrMean, 1), u: "bpm", cls: hrTone });
   _addCard(cards, { k: "FC Mínima", v: _formatNumber(hrMin, 1), u: "bpm" });
   _addCard(cards, { k: "FC Máxima", v: _formatNumber(hrMax, 1), u: "bpm" });
 
-  _addCard(cards, { k: "HRV Score", v: Number.isFinite(hrvScore) ? Math.round(hrvScore).toString() : "—", u: "0–100", cls: hrvTone });
+  _addCard(cards, {
+    k: "HRV Score",
+    v: Number.isFinite(hrvScore) ? Math.round(hrvScore).toString() : "—",
+    u: "0–100 (solo Polar)",
+    cls: scoreTone
+  });
+
   _addCard(cards, { k: "Respiración", v: _formatNumber(respRpm, 1), u: "rpm", cls: respTone });
 
-  // =========================
-  // BLOQUE 2: HRV (existente)
-  // =========================
+  if(sensorType === "camera_ppg"){
+    let qTone = "";
+    if(Number.isFinite(ppgQuality)){
+      if(ppgQuality >= 80) qTone = "good";
+      else if(ppgQuality >= 60) qTone = "warn";
+      else qTone = "bad";
+    }
+    _addCard(cards, {
+      k: "Calidad PPG",
+      v: Number.isFinite(ppgQuality) ? Math.round(ppgQuality).toString() : "—",
+      u: ppgValid === true ? "válida" : "no válida",
+      cls: qTone
+    });
+  }
+
+  // HRV details
   const items = [
     {k:"RMSSD", v: metrics.rmssd, u:"ms", d: 3},
     {k:"SDNN", v: metrics.sdnn, u:"ms", d: 3},
@@ -234,6 +261,7 @@ function buildCards(metrics){
     {k:"LF/HF", v: metrics.lf_hf, u:"ratio", d: 3},
     {k:"Total Power", v: metrics.total_power, u:"ms²", d: 3},
     {k:"Artefactos", v: metrics.artifact_percent, u:"%", d: 1},
+    {k:"n RR", v: metrics.n_rr, u:"intervalos", d: 0},
   ];
 
   items.forEach(it => {
@@ -252,7 +280,7 @@ function buildCards(metrics){
 }
 
 // ----------------------------
-// Cámara PPG (mejorada para Android)
+// Cámara PPG (Android robust)
 // ----------------------------
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
@@ -262,7 +290,6 @@ async function startCameraPPG(){
   ppgSamples = [];
   ppgTimestamps = [];
 
-  // Forzar cámara trasera + FPS alto (más estable para PPG)
   mediaStream = await navigator.mediaDevices.getUserMedia({
     video: {
       facingMode: { exact: "environment" },
@@ -277,19 +304,16 @@ async function startCameraPPG(){
   videoEl.playsInline = true;
   videoEl.muted = true;
 
-  // En Android muchas veces hay que forzar play()
   try { await videoEl.play(); } catch(_e) {}
 
-  // Esperar frames reales
   const t0 = Date.now();
   while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
     await new Promise(r => setTimeout(r, 50));
   }
   if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-    throw new Error("Cámara autorizada pero sin frames. Asegurate de estar en Chrome (no webview) y revisá permisos.");
+    throw new Error("Cámara autorizada pero sin frames. Usá Chrome y revisá permisos.");
   }
 
-  // Intentar activar torch si está disponible
   let torchOn = false;
   const track = mediaStream.getVideoTracks()[0];
   try{
@@ -300,7 +324,6 @@ async function startCameraPPG(){
     }
   }catch(_e){}
 
-  // Canvas chico para performance
   const w = 160, h = 120;
   frameCanvas.width = w;
   frameCanvas.height = h;
@@ -309,11 +332,6 @@ async function startCameraPPG(){
 
   const intervalMs = Math.round(1000 / targetFps);
 
-  // Señal robusta:
-  // - meanR (DC) -> runningMean
-  // - AC = meanR - runningMean (pulsátil)
-  // - gráfico: AC amplificada para que se vea
-  // - backend: señal normalizada AC/DC
   let runningMean = null;
   let flatCount = 0;
 
@@ -335,19 +353,18 @@ async function startCameraPPG(){
 
     const ac = meanR - runningMean;
 
-    // Amplificar solo para visibilidad del gráfico
+    // gráfico visible
     const visible = ac * 80;
     pushChartPoint(visible);
 
-    // Señal para backend (mejor que meanR crudo)
+    // señal para backend
     const normalized = (runningMean !== 0) ? (ac / runningMean) : 0;
 
     ppgSamples.push(normalized);
     ppgTimestamps.push(performance.now());
 
-    // Si por ~2s casi todo es negro/0 -> avisar
     if (flatCount > (2000 / intervalMs)) {
-      setStatus("Sin señal útil (oscuro). Tapá el lente completamente y probá con más luz.", "bad");
+      setStatus("Sin señal útil (oscuro). Tapá el lente y probá con más luz.", "bad");
     }
   }, intervalMs);
 }
@@ -360,7 +377,6 @@ function stopCameraPPG(){
   if(mediaStream){
     const tracks = mediaStream.getVideoTracks();
     tracks.forEach(t => {
-      // apagar torch si estaba activo
       try { t.applyConstraints({ advanced: [{ torch: false }] }); } catch(_e) {}
       t.stop();
     });
@@ -370,7 +386,7 @@ function stopCameraPPG(){
 }
 
 // ----------------------------
-// Polar H10 BLE
+// BLE HR parser (Polar/Garmin)
 // ----------------------------
 function parseHeartRateMeasurement(value){
   const flags = value.getUint8(0);
@@ -396,6 +412,9 @@ function parseHeartRateMeasurement(value){
   return rrs;
 }
 
+// ----------------------------
+// Polar H10 (driver separado)
+// ----------------------------
 async function connectPolarH10(){
   if(!navigator.bluetooth){
     throw new Error("Web Bluetooth no disponible en este navegador.");
@@ -403,28 +422,30 @@ async function connectPolarH10(){
 
   setStatus("Buscando Polar H10…", "warn");
 
-  bleDevice = await navigator.bluetooth.requestDevice({
+  polarDevice = await navigator.bluetooth.requestDevice({
     filters: [{ services: ["heart_rate"] }]
   });
 
-  bleDevice.addEventListener("gattserverdisconnected", () => {
+  polarDeviceName = polarDevice?.name || "Polar H10";
+
+  polarDevice.addEventListener("gattserverdisconnected", () => {
     setStatus("Polar desconectado", "bad");
     measuring = false;
     enableControls();
   });
 
-  const server = await bleDevice.gatt.connect();
+  const server = await polarDevice.gatt.connect();
   const service = await server.getPrimaryService("heart_rate");
-  bleChar = await service.getCharacteristic("heart_rate_measurement");
+  polarChar = await service.getCharacteristic("heart_rate_measurement");
 
-  await bleChar.startNotifications();
-  bleChar.addEventListener("characteristicvaluechanged", (event) => {
+  await polarChar.startNotifications();
+  polarChar.addEventListener("characteristicvaluechanged", (event) => {
     if(!measuring) return;
     const dv = event.target.value;
     const rrs = parseHeartRateMeasurement(dv);
     if(rrs.length){
       rrs.forEach(rr => {
-        rrIntervalsMs.push(rr);
+        polarRrIntervalsMs.push(rr);
         pushChartPoint(rr);
       });
     }
@@ -434,24 +455,110 @@ async function connectPolarH10(){
 }
 
 async function startPolarH10(){
-  rrIntervalsMs = [];
+  polarRrIntervalsMs = [];
   await connectPolarH10();
 }
 
 async function stopPolarH10(){
-  try{ if(bleChar) await bleChar.stopNotifications(); }catch(_e){}
+  try{ if(polarChar) await polarChar.stopNotifications(); }catch(_e){}
   try{
-    if(bleDevice && bleDevice.gatt.connected){
-      bleDevice.gatt.disconnect();
+    if(polarDevice && polarDevice.gatt.connected){
+      polarDevice.gatt.disconnect();
     }
   }catch(_e){}
-  bleChar = null;
-  bleDevice = null;
+  polarChar = null;
+  polarDevice = null;
   setStatus("Polar detenido", "idle");
 }
 
 // ----------------------------
-// API helpers (robustez JSON)
+// Garmin HRM (driver separado)
+// ----------------------------
+function _isGarminName(name){
+  if(!name) return false;
+  const n = String(name).toLowerCase();
+  // nombres típicos: "HRM-Pro", "HRM-Dual", "Garmin HRM..."
+  return n.includes("garmin") || n.includes("hrm");
+}
+
+async function connectGarminHRM(){
+  if(!navigator.bluetooth){
+    throw new Error("Web Bluetooth no disponible en este navegador.");
+  }
+
+  setStatus("Buscando Garmin HRM…", "warn");
+
+  // Garmin a veces no aparece bien con filters estrictos → aceptamos todos y validamos por nombre
+  garminDevice = await navigator.bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices: ["heart_rate"]
+  });
+
+  garminDeviceName = garminDevice?.name || "Garmin HRM";
+
+  if(!_isGarminName(garminDeviceName)){
+    try{
+      if(garminDevice.gatt && garminDevice.gatt.connected) garminDevice.gatt.disconnect();
+    }catch(_e){}
+    garminDevice = null;
+    throw new Error(`Dispositivo no parece Garmin HRM: "${garminDeviceName}". Seleccioná tu banda Garmin (HRM).`);
+  }
+
+  garminDevice.addEventListener("gattserverdisconnected", () => {
+    setStatus("Garmin desconectado", "bad");
+    measuring = false;
+    enableControls();
+  });
+
+  const server = await garminDevice.gatt.connect();
+  const service = await server.getPrimaryService("heart_rate");
+  garminChar = await service.getCharacteristic("heart_rate_measurement");
+
+  let rrSeen = false;
+
+  await garminChar.startNotifications();
+  garminChar.addEventListener("characteristicvaluechanged", (event) => {
+    if(!measuring) return;
+    const dv = event.target.value;
+    const rrs = parseHeartRateMeasurement(dv);
+    if(rrs.length){
+      rrSeen = true;
+      rrs.forEach(rr => {
+        garminRrIntervalsMs.push(rr);
+        pushChartPoint(rr);
+      });
+    }
+  });
+
+  // Si en ~5s no vimos RR, avisar (sin cortar medición: algunos mandan RR más tarde, pero es raro)
+  setTimeout(() => {
+    if(measuring && sensorType === "garmin_hrm" && !rrSeen){
+      setStatus("Garmin conectado pero sin RR (solo HR). Sin RR no hay HRV.", "warn");
+    }
+  }, 5000);
+
+  setStatus(`Garmin conectado • recolectando RR`, "ok");
+}
+
+async function startGarminHRM(){
+  garminRrIntervalsMs = [];
+  await connectGarminHRM();
+}
+
+async function stopGarminHRM(){
+  try{ if(garminChar) await garminChar.stopNotifications(); }catch(_e){}
+  try{
+    if(garminDevice && garminDevice.gatt.connected){
+      garminDevice.gatt.disconnect();
+    }
+  }catch(_e){}
+  garminChar = null;
+  garminDevice = null;
+  setStatus("Garmin detenido", "idle");
+}
+
+// ----------------------------
+// API helper
 // ----------------------------
 async function fetchJsonOrThrow(url, payload){
   const res = await fetch(url, {
@@ -476,7 +583,7 @@ async function fetchJsonOrThrow(url, payload){
 }
 
 // ----------------------------
-// Medición: start/stop/compute/save
+// Medición start/stop/compute/save
 // ----------------------------
 async function startMeasurement(){
   lastMetrics = null;
@@ -487,7 +594,6 @@ async function startMeasurement(){
   enableControls();
   setSensorChip();
 
-  // Reset chart
   chart.data.labels = [];
   chart.data.datasets[0].data = [];
   chart.update("none");
@@ -503,8 +609,10 @@ async function startMeasurement(){
 
   if(sensorType === "camera_ppg"){
     await startCameraPPG();
-  } else {
+  } else if(sensorType === "polar_h10"){
     await startPolarH10();
+  } else {
+    await startGarminHRM();
   }
 }
 
@@ -522,19 +630,21 @@ async function stopMeasurement(){
 
   if(sensorType === "camera_ppg"){
     stopCameraPPG();
-  } else {
+  } else if(sensorType === "polar_h10"){
     await stopPolarH10();
+  } else {
+    await stopGarminHRM();
   }
 
   setStatus("Procesando HRV…", "warn");
 
   let payload = {
     sensor_type: sensorType,
-    duration_minutes: selectedDurationMin
+    duration_minutes: selectedDurationMin,
+    device_name: ""
   };
 
   if(sensorType === "camera_ppg"){
-    // sampling rate estimado real
     let fs = targetFps;
     if(ppgTimestamps.length > 10){
       const diffs = [];
@@ -546,8 +656,13 @@ async function stopMeasurement(){
     }
     payload.ppg = ppgSamples;
     payload.sampling_rate = fs;
+    payload.device_name = "Camera PPG";
+  } else if(sensorType === "polar_h10"){
+    payload.rri_ms = polarRrIntervalsMs;
+    payload.device_name = polarDeviceName || "Polar H10";
   } else {
-    payload.rri_ms = rrIntervalsMs;
+    payload.rri_ms = garminRrIntervalsMs;
+    payload.device_name = garminDeviceName || "Garmin HRM";
   }
 
   try{
