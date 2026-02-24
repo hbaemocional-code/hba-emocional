@@ -1,3 +1,4 @@
+# app.py  (COMPLETO)
 import os
 from datetime import datetime
 
@@ -19,7 +20,6 @@ DATASET_FILE = os.path.join(DATASET_DIR, "dataset_hba.csv")
 # ============================
 # Utilidades
 # ============================
-
 def _as_float(x):
     try:
         if x is None or x == "":
@@ -34,36 +34,28 @@ def _finite_array(x):
     return x[np.isfinite(x)]
 
 
-def _nan_to_none(x):
-    # JSON-safe: NaN/inf -> None
-    if isinstance(x, (float, np.floating)):
-        if not np.isfinite(x):
-            return None
-        return float(x)
-    if isinstance(x, (int, np.integer)):
-        return int(x)
-    return x
-
-
-def sanitize_for_json(obj):
-    if isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [sanitize_for_json(v) for v in obj]
-    return _nan_to_none(obj)
+def json_safe(d: dict):
+    """Evita NaN/inf en JSON (causa 'Unexpected token N')."""
+    out = {}
+    for k, v in (d or {}).items():
+        if isinstance(v, (np.floating, float)) and (not np.isfinite(v)):
+            out[k] = None
+        elif isinstance(v, (np.integer, int)):
+            out[k] = int(v)
+        else:
+            out[k] = v
+    return out
 
 
 # ============================
 # Calidad RR + Corrección
 # ============================
-
 def clean_rri_ms(rri_ms: np.ndarray):
     """
-    Limpieza/corrección RR (ms):
+    Limpieza/corrección de RR (ms):
     - Rechazo fisiológico: 300–2000 ms
     - Outliers robustos (MAD)
     - Corrección por interpolación lineal
-    Devuelve: rri_clean, artifact_percent, mask_artifact
     """
     rri_ms = _finite_array(rri_ms)
 
@@ -115,58 +107,35 @@ def rri_to_peaks(rri_ms: np.ndarray, sampling_rate=1000):
     return peaks
 
 
-def rri_to_hr_stats(rri_ms: np.ndarray):
-    rri_ms = _finite_array(rri_ms)
-    if len(rri_ms) < 3:
-        return np.nan, np.nan, np.nan
-    hr = 60000.0 / rri_ms
-    return float(np.mean(hr)), float(np.min(hr)), float(np.max(hr))
-
-
-def estimate_resp_rate_from_hrv_freq(hrv_freq_df):
-    """
-    Estimación simple de FR (rpm) a partir del pico HF (si existe).
-    NO es clínica; sirve como biomarcador aproximado.
-    """
-    try:
-        hf_peak = _as_float(hrv_freq_df.get("HRV_HF_Peak", pd.Series([np.nan])).iloc[0])
-        if np.isfinite(hf_peak) and hf_peak > 0:
-            # Hz -> rpm
-            return float(hf_peak * 60.0)
-    except Exception:
-        pass
-    return np.nan
-
-
-def recovery_score(lnrmssd, hr_mean_bpm, artifact_percent):
-    """
-    Score operativo 0-100:
-    - lnRMSSD alto -> mejor
-    - HR mean alto -> peor (ligero)
-    - artefactos altos -> penaliza
-    """
-    if not np.isfinite(lnrmssd):
-        return np.nan
-    # lnRMSSD típico reposo ~2.5–4.5
-    x = (lnrmssd - 3.2) / 0.6  # normalización suave
-    score = 50 + 20 * np.tanh(x)  # 30..70 aprox
-
-    if np.isfinite(hr_mean_bpm):
-        score -= 0.12 * max(0.0, hr_mean_bpm - 65)  # penaliza si HR>65
-
-    if np.isfinite(artifact_percent):
-        # fuerte penalización si artefactos altos
-        if artifact_percent > 5:
-            score -= (artifact_percent - 5) * 1.2
-
-    return float(np.clip(score, 0, 100))
-
-
 # ============================
 # HRV Backend
 # ============================
+def _hr_from_rri(rri_ms: np.ndarray):
+    rri_ms = _finite_array(rri_ms)
+    if len(rri_ms) < 3:
+        return np.nan, np.nan
+    hr = 60000.0 / rri_ms
+    hr_mean = float(np.nanmean(hr)) if len(hr) else np.nan
+    hr_max = float(np.nanmax(hr)) if len(hr) else np.nan
+    return hr_mean, hr_max
+
+
+def _hrv_score_from_lnrmssd(lnrmssd: float):
+    # Escala 0-100 tipo app (índice visual, NO diagnóstico)
+    if lnrmssd is None or not np.isfinite(lnrmssd):
+        return np.nan
+    score = 10 + (np.clip((float(lnrmssd) - 2.5) / (5.0 - 2.5), 0, 1) * 85)
+    return float(score)
+
 
 def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
+    """
+    HRV desde RR (ms).
+    Time: RMSSD, SDNN, lnRMSSD, pNN50, Mean RR
+    Freq: LF, HF, LF/HF, Total Power
+    + HR mean / HR max
+    + HRV score (visual)
+    """
     rri_ms = _finite_array(rri_ms)
 
     if len(rri_ms) < 20:
@@ -175,7 +144,9 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
             "artifact_percent": np.nan
         }
 
-    rri_clean, artifact_percent, _mask = clean_rri_ms(rri_ms)
+    rri_clean, artifact_percent, _mask_art = clean_rri_ms(rri_ms)
+
+    hr_mean, hr_max = _hr_from_rri(rri_clean)
 
     try:
         hrv_time = nk.hrv_time(rri=rri_clean, show=False)
@@ -183,7 +154,10 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
     except Exception:
         peaks = rri_to_peaks(rri_clean, sampling_rate=1000)
         if peaks is None:
-            return {"error": "No se pudo construir tren de picos desde RR.", "artifact_percent": artifact_percent}
+            return {
+                "error": "No se pudo construir tren de picos desde RR.",
+                "artifact_percent": artifact_percent
+            }
         hrv_time = nk.hrv_time(peaks, sampling_rate=1000, show=False)
         hrv_freq = nk.hrv_frequency(peaks, sampling_rate=1000, show=False)
 
@@ -204,10 +178,6 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
     tp = g(hrv_freq, "HRV_TP")
     lfhf = (lf / hf) if np.isfinite(lf) and np.isfinite(hf) and hf > 0 else np.nan
 
-    hr_mean, hr_min, hr_max = rri_to_hr_stats(rri_clean)
-    resp_rpm = estimate_resp_rate_from_hrv_freq(hrv_freq)
-    rec = recovery_score(lnrmssd, hr_mean, artifact_percent)
-
     freq_warning = None
     if duration_minutes is not None:
         try:
@@ -216,6 +186,8 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
                 freq_warning = "Segmento < 5 min: LF/HF y potencia espectral pueden ser menos estables."
         except Exception:
             pass
+
+    hrv_score = _hrv_score_from_lnrmssd(lnrmssd)
 
     return {
         "rmssd": rmssd,
@@ -229,83 +201,58 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
         "total_power": tp,
         "artifact_percent": artifact_percent,
         "n_rr": int(len(rri_clean)),
-        "hr_mean_bpm": hr_mean,
-        "hr_min_bpm": hr_min,
-        "hr_max_bpm": hr_max,
-        "resp_rate_rpm": resp_rpm,
-        "recovery_score": rec,
+        "hr_mean": hr_mean,
+        "hr_max": hr_max,
+        "hrv_score": hrv_score,
         "freq_warning": freq_warning
     }
 
 
 def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes=None):
+    """
+    Cámara PPG -> FILTRO + PICOS + RR -> usa el MISMO motor RR que Polar.
+    Así HR y HRV quedan coherentes (no delirantes).
+    """
     ppg = _finite_array(ppg)
-    if sampling_rate is None or not np.isfinite(sampling_rate) or sampling_rate <= 1:
+    if sampling_rate is None or not np.isfinite(sampling_rate) or sampling_rate <= 5:
         return {"error": "sampling_rate inválido."}
 
     min_seconds = 60
     if len(ppg) < int(sampling_rate * min_seconds):
         return {"error": f"PPG insuficiente (mínimo {min_seconds}s). Recomendado 3–5 min."}
 
-    # Normalización robusta para PPG (reduce valores locos)
-    med = np.median(ppg)
-    mad = np.median(np.abs(ppg - med)) + 1e-9
-    ppg_z = (ppg - med) / mad
-
-    # Bandpass para rango cardíaco (aprox 0.7–4 Hz)
+    # Filtrado banda cardíaca
     try:
-        ppg_f = nk.signal_filter(ppg_z, sampling_rate=sampling_rate, lowcut=0.7, highcut=4.0, method="butterworth", order=3)
-    except Exception:
-        ppg_f = ppg_z
-
-    # Peaks (robusto)
-    try:
-        signals, info = nk.ppg_process(ppg_f, sampling_rate=sampling_rate)
-        peaks = info.get("PPG_Peaks", None)
-        if peaks is None:
-            peaks, _ = nk.ppg_peaks(ppg_f, sampling_rate=sampling_rate)
+        ppg = ppg - np.median(ppg)
+        ppg = nk.signal_filter(
+            ppg,
+            sampling_rate=sampling_rate,
+            lowcut=0.7,
+            highcut=4.0,
+            method="butterworth",
+            order=2
+        )
     except Exception as e:
-        return {"error": f"Fallo en procesamiento PPG: {str(e)}"}
+        return {"error": f"Fallo filtrando PPG: {str(e)}"}
+
+    # Picos robustos
+    try:
+        min_distance = int(0.35 * sampling_rate)  # ~170 bpm
+        peaks_dict, _ = nk.signal_findpeaks(ppg, sampling_rate=sampling_rate, distance=min_distance)
+        peaks_idx = np.array(peaks_dict.get("Peaks", []), dtype=int)
+    except Exception as e:
+        return {"error": f"Fallo detectando picos PPG: {str(e)}"}
+
+    if peaks_idx.size < 10:
+        return {"error": "No se detectaron suficientes latidos. Evitá movimiento y asegurá buena presión/dedo."}
 
     # RR desde picos
-    try:
-        # peaks binario -> índices
-        idx = np.where(np.asarray(peaks) == 1)[0]
-        if len(idx) < 20:
-            return {"error": "Pocos picos detectados en PPG. Probá reubicar el dedo y repetir.", "artifact_percent": np.nan}
+    rr_s = np.diff(peaks_idx) / float(sampling_rate)
+    rri_ms = rr_s * 1000.0
 
-        rri_ms = np.diff(idx) / float(sampling_rate) * 1000.0
-        rri_clean, artifact_percent, _mask = clean_rri_ms(rri_ms)
-
-        # Quality gate suave: si artefactos altísimos, avisar pero NO bloquear todo
-        ppg_quality = "ok"
-        if np.isfinite(artifact_percent):
-            if artifact_percent <= 8:
-                ppg_quality = "good"
-            elif artifact_percent <= 18:
-                ppg_quality = "moderate"
-            else:
-                ppg_quality = "poor"
-    except Exception as e:
-        return {"error": f"No se pudo derivar RR desde PPG: {str(e)}"}
-
-    # HRV desde RR limpio (mismo pipeline que Polar)
-    out = compute_hrv_from_rri(rri_clean, duration_minutes=duration_minutes)
-    if "error" in out:
-        # si falla HRV, al menos devolvemos HR stats y calidad
-        hr_mean, hr_min, hr_max = rri_to_hr_stats(rri_clean)
-        return {
-            "error": out["error"],
-            "artifact_percent": artifact_percent,
-            "hr_mean_bpm": hr_mean,
-            "hr_min_bpm": hr_min,
-            "hr_max_bpm": hr_max,
-            "ppg_quality": ppg_quality,
-            "ppg_valid": False
-        }
-
-    out["ppg_quality"] = ppg_quality
-    out["ppg_valid"] = (ppg_quality != "poor")
+    # Pasamos por motor RR (misma limpieza + hrv)
+    out = compute_hrv_from_rri(rri_ms, duration_minutes=duration_minutes)
+    out["n_beats"] = int(peaks_idx.size)
     out["n_samples"] = int(len(ppg))
     out["sampling_rate"] = float(sampling_rate)
     return out
@@ -314,7 +261,6 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
 # ============================
 # Persistencia CSV
 # ============================
-
 CSV_COLUMNS = [
     "timestamp_utc",
     "student_id",
@@ -322,6 +268,9 @@ CSV_COLUMNS = [
     "comorbidities",
     "sensor_type",
     "duration_minutes",
+    "hr_mean",
+    "hr_max",
+    "hrv_score",
     "rmssd",
     "sdnn",
     "lnrmssd",
@@ -332,13 +281,6 @@ CSV_COLUMNS = [
     "lf_hf",
     "total_power",
     "artifact_percent",
-    "hr_mean_bpm",
-    "hr_min_bpm",
-    "hr_max_bpm",
-    "resp_rate_rpm",
-    "recovery_score",
-    "ppg_quality",
-    "ppg_valid",
     "freq_warning",
     "notes",
 ]
@@ -360,10 +302,38 @@ def append_to_dataset(row: dict):
     df.to_csv(DATASET_FILE, index=False)
 
 
+def load_history(student_id: str):
+    if not os.path.exists(DATASET_FILE):
+        return []
+    df = pd.read_csv(DATASET_FILE)
+    if "student_id" not in df.columns:
+        return []
+    df = df[df["student_id"].astype(str) == str(student_id)]
+    if df.empty:
+        return []
+    # ordenar por fecha
+    if "timestamp_utc" in df.columns:
+        df["timestamp_utc"] = df["timestamp_utc"].astype(str)
+    df = df.sort_values(by="timestamp_utc", ascending=True)
+
+    # devolver últimos 60
+    df = df.tail(60)
+    out = []
+    for _, r in df.iterrows():
+        out.append({
+            "t": str(r.get("timestamp_utc", "")),
+            "rmssd": _as_float(r.get("rmssd", np.nan)),
+            "hr_mean": _as_float(r.get("hr_mean", np.nan)),
+            "hrv_score": _as_float(r.get("hrv_score", np.nan)),
+            "artifact_percent": _as_float(r.get("artifact_percent", np.nan)),
+            "sensor_type": str(r.get("sensor_type", "")),
+        })
+    return out
+
+
 # ============================
 # Flask
 # ============================
-
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -381,7 +351,7 @@ def api_compute():
         result = compute_hrv_from_rri(np.array(rri_ms, dtype=float), duration_minutes=duration_minutes)
         result["sensor_type"] = "polar_h10"
         result["duration_minutes"] = duration_minutes
-        return jsonify(sanitize_for_json(result))
+        return jsonify(json_safe(result))
 
     if sensor_type == "camera_ppg":
         ppg = payload.get("ppg", [])
@@ -389,7 +359,7 @@ def api_compute():
         result = compute_hrv_from_ppg(np.array(ppg, dtype=float), float(sampling_rate), duration_minutes=duration_minutes)
         result["sensor_type"] = "camera_ppg"
         result["duration_minutes"] = duration_minutes
-        return jsonify(sanitize_for_json(result))
+        return jsonify(json_safe(result))
 
     return jsonify({"error": "sensor_type inválido. Use 'camera_ppg' o 'polar_h10'."}), 400
 
@@ -412,56 +382,36 @@ def api_save():
         "comorbidities": comorbidities,
         "sensor_type": metrics.get("sensor_type", ""),
         "duration_minutes": metrics.get("duration_minutes", ""),
+        "hr_mean": metrics.get("hr_mean", ""),
+        "hr_max": metrics.get("hr_max", ""),
+        "hrv_score": metrics.get("hrv_score", ""),
         "rmssd": metrics.get("rmssd", ""),
         "sdnn": metrics.get("sdnn", ""),
         "lnrmssd": metrics.get("lnrmssd", ""),
         "pnn50": metrics.get("pnn50", ""),
         "mean_rr": metrics.get("mean_rr", ""),
         "lf_power": metrics.get("lf_power", ""),
-        "hf_power": metrics.get("hf_power", ""),
+        "hf_power": metrics.get("hf_hf", "") if False else metrics.get("hf_power", ""),
         "lf_hf": metrics.get("lf_hf", ""),
         "total_power": metrics.get("total_power", ""),
         "artifact_percent": metrics.get("artifact_percent", ""),
-        "hr_mean_bpm": metrics.get("hr_mean_bpm", ""),
-        "hr_min_bpm": metrics.get("hr_min_bpm", ""),
-        "hr_max_bpm": metrics.get("hr_max_bpm", ""),
-        "resp_rate_rpm": metrics.get("resp_rate_rpm", ""),
-        "recovery_score": metrics.get("recovery_score", ""),
-        "ppg_quality": metrics.get("ppg_quality", ""),
-        "ppg_valid": metrics.get("ppg_valid", ""),
         "freq_warning": metrics.get("freq_warning", ""),
         "notes": notes,
     }
 
-    append_to_dataset(sanitize_for_json(row))
-    return jsonify({"ok": True, "file": DATASET_FILE})
+    append_to_dataset(row)
+    return jsonify({"ok": True, "file": os.path.basename(DATASET_FILE)})
 
 
 @app.route("/api/history", methods=["GET"])
 def api_history():
-    student_id = (request.args.get("student_id") or "").strip()
+    student_id = str(request.args.get("student_id", "")).strip()
     if not student_id:
         return jsonify({"error": "student_id requerido"}), 400
-
-    if not os.path.exists(DATASET_FILE):
-        return jsonify({"rows": []})
-
-    df = pd.read_csv(DATASET_FILE)
-    if "student_id" not in df.columns:
-        return jsonify({"rows": []})
-
-    df = df[df["student_id"].astype(str).str.strip() == student_id].copy()
-    if df.empty:
-        return jsonify({"rows": []})
-
-    if "timestamp_utc" in df.columns:
-        df["timestamp_utc"] = df["timestamp_utc"].astype(str)
-        df = df.sort_values("timestamp_utc")
-
-    cols = [c for c in ["timestamp_utc", "rmssd", "lnrmssd", "hr_mean_bpm", "artifact_percent", "sensor_type"] if c in df.columns]
-    rows = df[cols].tail(50).to_dict(orient="records")
-    return jsonify({"rows": sanitize_for_json(rows)})
+    hist = load_history(student_id)
+    return jsonify(json_safe({"ok": True, "items": hist}))
 
 
 if __name__ == "__main__":
+    # local
     app.run(host="0.0.0.0", port=5000, debug=True)
