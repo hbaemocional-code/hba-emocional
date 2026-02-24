@@ -13,7 +13,7 @@ let frameCtx = null;
 
 let ppgSamples = [];
 let ppgTimestamps = [];
-let targetFps = 30;
+let targetFps = 45; // antes 30: mejor 45 para PPG
 let cameraLoopHandle = null;
 
 // Polar H10 BLE
@@ -190,7 +190,7 @@ function buildCards(metrics){
 }
 
 // ----------------------------
-// Cámara PPG
+// Cámara PPG (mejorada para Android)
 // ----------------------------
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
@@ -200,24 +200,60 @@ async function startCameraPPG(){
   ppgSamples = [];
   ppgTimestamps = [];
 
+  // Forzar cámara trasera + FPS alto (más estable para PPG)
   mediaStream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment" },
+    video: {
+      facingMode: { exact: "environment" },
+      frameRate: { ideal: 60, min: 30 },
+      width: { ideal: 1280 },
+      height: { ideal: 720 }
+    },
     audio: false
   });
 
   videoEl.srcObject = mediaStream;
+  videoEl.playsInline = true;
+  videoEl.muted = true;
 
-  await new Promise((res) => {
-    videoEl.onloadedmetadata = () => res();
-  });
+  // En Android muchas veces hay que forzar play()
+  try { await videoEl.play(); } catch(_e) {}
 
+  // Esperar frames reales
+  const t0 = Date.now();
+  while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
+    throw new Error("Cámara autorizada pero sin frames. Asegurate de estar en Chrome (no webview) y revisá permisos.");
+  }
+
+  // Intentar activar torch si está disponible
+  let torchOn = false;
+  const track = mediaStream.getVideoTracks()[0];
+  try{
+    const caps = track.getCapabilities?.();
+    if (caps && caps.torch) {
+      await track.applyConstraints({ advanced: [{ torch: true }] });
+      torchOn = true;
+    }
+  }catch(_e){}
+
+  // Canvas chico para performance
   const w = 160, h = 120;
   frameCanvas.width = w;
   frameCanvas.height = h;
 
-  setStatus("Cámara activa • recolectando PPG", "ok");
+  setStatus(torchOn ? "Cámara trasera + torch ON • recolectando PPG" : "Cámara trasera • recolectando PPG", torchOn ? "ok" : "warn");
 
   const intervalMs = Math.round(1000 / targetFps);
+
+  // Señal robusta:
+  // - meanR (DC) -> runningMean
+  // - AC = meanR - runningMean (pulsátil)
+  // - gráfico: AC amplificada para que se vea
+  // - backend: señal normalizada AC/DC
+  let runningMean = null;
+  let flatCount = 0;
 
   cameraLoopHandle = setInterval(() => {
     if(!measuring) return;
@@ -226,14 +262,31 @@ async function startCameraPPG(){
     const img = frameCtx.getImageData(0, 0, w, h).data;
 
     let sumR = 0;
-    for(let i=0; i<img.length; i+=4){
-      sumR += img[i];
-    }
+    for(let i=0; i<img.length; i+=4) sumR += img[i];
     const meanR = sumR / (img.length / 4);
 
-    ppgSamples.push(meanR);
+    if (!Number.isFinite(meanR) || meanR < 2) flatCount++;
+    else flatCount = Math.max(0, flatCount - 1);
+
+    if (runningMean === null) runningMean = meanR;
+    runningMean = 0.97 * runningMean + 0.03 * meanR;
+
+    const ac = meanR - runningMean;
+
+    // Amplificar solo para visibilidad del gráfico
+    const visible = ac * 80;
+    pushChartPoint(visible);
+
+    // Señal para backend (mejor que meanR crudo)
+    const normalized = (runningMean !== 0) ? (ac / runningMean) : 0;
+
+    ppgSamples.push(normalized);
     ppgTimestamps.push(performance.now());
-    pushChartPoint(meanR);
+
+    // Si por ~2s casi todo es negro/0 -> avisar
+    if (flatCount > (2000 / intervalMs)) {
+      setStatus("Sin señal útil (oscuro). Tapá el lente completamente y probá con más luz.", "bad");
+    }
   }, intervalMs);
 }
 
@@ -243,7 +296,12 @@ function stopCameraPPG(){
     cameraLoopHandle = null;
   }
   if(mediaStream){
-    mediaStream.getTracks().forEach(t => t.stop());
+    const tracks = mediaStream.getVideoTracks();
+    tracks.forEach(t => {
+      // apagar torch si estaba activo
+      try { t.applyConstraints({ advanced: [{ torch: false }] }); } catch(_e) {}
+      t.stop();
+    });
     mediaStream = null;
   }
   setStatus("Cámara detenida", "idle");
