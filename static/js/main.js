@@ -13,7 +13,7 @@ let frameCtx = null;
 
 let ppgSamples = [];
 let ppgTimestamps = [];
-let targetFps = 45; // antes 30: mejor 45 para PPG
+let targetFps = 45; // mejor 45 para PPG
 let cameraLoopHandle = null;
 
 // Polar H10 BLE
@@ -131,6 +131,28 @@ function setupSensorSelector(){
   });
 }
 
+/**
+ * Helpers de UI para cards
+ */
+function _toNumber(v){
+  if (typeof v === "number") return v;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function _formatNumber(v, decimals){
+  const n = _toNumber(v);
+  if (!Number.isFinite(n)) return "—";
+  return n.toFixed(decimals);
+}
+
+function _addCard(cardsEl, {k, v, u, cls=""}){
+  const c = document.createElement("div");
+  c.className = `card ${cls}`.trim();
+  c.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div><div class="u">${u}</div>`;
+  cardsEl.appendChild(c);
+}
+
 function buildCards(metrics){
   const cards = document.getElementById("cards");
   const freqHint = document.getElementById("freqHint");
@@ -152,40 +174,80 @@ function buildCards(metrics){
   if(metrics.error){
     const c = document.createElement("div");
     c.className = "card bad";
-    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá duración/señal</div>`;
+    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá duración / señal / permisos</div>`;
     cards.appendChild(c);
     return;
   }
 
+  // =========================
+  // BLOQUE 1: “Vitals” (nuevo)
+  // =========================
+  // HR mean/min/max + HRV score + respiración estimada
+  const hrMean = _toNumber(metrics.hr_mean_bpm);
+  const hrMin  = _toNumber(metrics.hr_min_bpm);
+  const hrMax  = _toNumber(metrics.hr_max_bpm);
+  const hrvScore = _toNumber(metrics.hrv_score);
+  const respRpm = _toNumber(metrics.resp_rate_rpm);
+
+  // HRV score tone (heurístico)
+  let hrvTone = "";
+  if(Number.isFinite(hrvScore)){
+    if(hrvScore >= 70) hrvTone = "good";
+    else if(hrvScore >= 40) hrvTone = "warn";
+    else hrvTone = "bad";
+  }
+
+  // Resp rate tone (adulto reposo aproximado 10–20 rpm)
+  let respTone = "";
+  if(Number.isFinite(respRpm)){
+    if(respRpm >= 10 && respRpm <= 20) respTone = "good";
+    else if((respRpm >= 8 && respRpm < 10) || (respRpm > 20 && respRpm <= 24)) respTone = "warn";
+    else respTone = "bad";
+  }
+
+  // HR tone (solo para visual, no diagnóstico)
+  let hrTone = "";
+  if(Number.isFinite(hrMean)){
+    if(hrMean >= 50 && hrMean <= 90) hrTone = "good";
+    else if((hrMean >= 40 && hrMean < 50) || (hrMean > 90 && hrMean <= 110)) hrTone = "warn";
+    else hrTone = "bad";
+  }
+
+  _addCard(cards, { k: "FC Media", v: _formatNumber(hrMean, 1), u: "bpm", cls: hrTone });
+  _addCard(cards, { k: "FC Mínima", v: _formatNumber(hrMin, 1), u: "bpm" });
+  _addCard(cards, { k: "FC Máxima", v: _formatNumber(hrMax, 1), u: "bpm" });
+
+  _addCard(cards, { k: "HRV Score", v: Number.isFinite(hrvScore) ? Math.round(hrvScore).toString() : "—", u: "0–100", cls: hrvTone });
+  _addCard(cards, { k: "Respiración", v: _formatNumber(respRpm, 1), u: "rpm", cls: respTone });
+
+  // =========================
+  // BLOQUE 2: HRV (existente)
+  // =========================
   const items = [
-    {k:"RMSSD", v: metrics.rmssd, u:"ms"},
-    {k:"SDNN", v: metrics.sdnn, u:"ms"},
-    {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)"},
-    {k:"pNN50", v: metrics.pnn50, u:"%"},
-    {k:"Mean RR", v: metrics.mean_rr, u:"ms"},
-    {k:"LF Power", v: metrics.lf_power, u:"ms²"},
-    {k:"HF Power", v: metrics.hf_power, u:"ms²"},
-    {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
-    {k:"Total Power", v: metrics.total_power, u:"ms²"},
-    {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
+    {k:"RMSSD", v: metrics.rmssd, u:"ms", d: 3},
+    {k:"SDNN", v: metrics.sdnn, u:"ms", d: 3},
+    {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)", d: 3},
+    {k:"pNN50", v: metrics.pnn50, u:"%", d: 3},
+    {k:"Mean RR", v: metrics.mean_rr, u:"ms", d: 3},
+    {k:"LF Power", v: metrics.lf_power, u:"ms²", d: 3},
+    {k:"HF Power", v: metrics.hf_power, u:"ms²", d: 3},
+    {k:"LF/HF", v: metrics.lf_hf, u:"ratio", d: 3},
+    {k:"Total Power", v: metrics.total_power, u:"ms²", d: 3},
+    {k:"Artefactos", v: metrics.artifact_percent, u:"%", d: 1},
   ];
 
   items.forEach(it => {
-    const num = typeof it.v === "number" ? it.v : Number(it.v);
+    const num = _toNumber(it.v);
     const isNum = Number.isFinite(num);
-    const val = isNum ? num.toFixed(3) : "—";
+    const val = isNum ? num.toFixed(it.d) : "—";
 
-    let cls = "card";
+    let cls = "";
     if(it.k === "Artefactos" && isNum){
-      if(num <= 5) cls += " good";
-      else if(num <= 12) cls += " warn";
-      else cls += " bad";
+      if(num <= 5) cls = "good";
+      else if(num <= 12) cls = "warn";
+      else cls = "bad";
     }
-
-    const c = document.createElement("div");
-    c.className = cls;
-    c.innerHTML = `<div class="k">${it.k}</div><div class="v">${val}</div><div class="u">${it.u}</div>`;
-    cards.appendChild(c);
+    _addCard(cards, { k: it.k, v: val, u: it.u, cls });
   });
 }
 
@@ -389,6 +451,31 @@ async function stopPolarH10(){
 }
 
 // ----------------------------
+// API helpers (robustez JSON)
+// ----------------------------
+async function fetchJsonOrThrow(url, payload){
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+
+  if(!res.ok){
+    const text = await res.text();
+    throw new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+
+  if(!contentType.includes("application/json")){
+    const text = await res.text();
+    throw new Error(`Respuesta no-JSON: ${text.slice(0, 200)}`);
+  }
+
+  return await res.json();
+}
+
+// ----------------------------
 // Medición: start/stop/compute/save
 // ----------------------------
 async function startMeasurement(){
@@ -464,12 +551,7 @@ async function stopMeasurement(){
   }
 
   try{
-    const res = await fetch("/api/compute", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    const metrics = await res.json();
+    const metrics = await fetchJsonOrThrow("/api/compute", payload);
     lastMetrics = metrics;
 
     buildCards(metrics);
@@ -477,7 +559,7 @@ async function stopMeasurement(){
     if(metrics.error){
       setStatus("Error en cálculo (ver tarjetas)", "bad");
     } else {
-      const art = Number(metrics.artifact_percent);
+      const art = _toNumber(metrics.artifact_percent);
       if(Number.isFinite(art)){
         if(art <= 5) setStatus("Cálculo OK • Calidad buena", "ok");
         else if(art <= 12) setStatus("Cálculo OK • Calidad moderada", "warn");
@@ -517,12 +599,7 @@ async function saveResult(){
   setStatus("Guardando en dataset_hba.csv…", "warn");
 
   try{
-    const res = await fetch("/api/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    const out = await res.json();
+    const out = await fetchJsonOrThrow("/api/save", payload);
     if(out.ok){
       setStatus("Guardado OK • dataset_hba.csv actualizado", "ok");
     } else {
