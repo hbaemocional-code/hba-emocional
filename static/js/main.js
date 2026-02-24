@@ -1,3 +1,4 @@
+// static/js/main.js  (COMPLETO)
 let selectedDurationMin = 3;
 let measuring = false;
 let sensorType = "camera_ppg";
@@ -22,9 +23,9 @@ let bleChar = null;
 let rrIntervalsMs = [];
 let lastMetrics = null;
 
-// Chart.js
+// Charts
 let chart = null;
-let historyChart = null;
+let trendChart = null;
 
 function setStatus(text, level="idle"){
   const dot = document.getElementById("statusDot");
@@ -84,7 +85,7 @@ function initChart(){
         data: [],
         pointRadius: 0,
         borderWidth: 2,
-        tension: 0.22
+        tension: 0.35
       }]
     },
     options: {
@@ -94,7 +95,32 @@ function initChart(){
       plugins: { legend: { display: false } },
       scales: {
         x: { display: false },
-        y: { display: true, ticks: { color: "#95a3b7" } }
+        y: { display: true, ticks: { color: "#98a6bf" } }
+      }
+    }
+  });
+}
+
+function initTrendChart(){
+  const ctx = document.getElementById("trendChart");
+  trendChart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        { label: "RMSSD", data: [], pointRadius: 2, borderWidth: 2, tension: 0.25 },
+        { label: "HR media", data: [], pointRadius: 2, borderWidth: 2, tension: 0.25 },
+        { label: "HRV score", data: [], pointRadius: 2, borderWidth: 2, tension: 0.25 },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: { legend: { display: true, labels: { color: "#98a6bf" } } },
+      scales: {
+        x: { display: true, ticks: { color: "#98a6bf", maxRotation: 0, autoSkip: true } },
+        y: { display: true, ticks: { color: "#98a6bf" } }
       }
     }
   });
@@ -109,34 +135,6 @@ function pushChartPoint(value){
     chart.data.datasets[0].data.shift();
   }
   chart.update("none");
-}
-
-function initHistoryChart(){
-  const ctx = document.getElementById("historyChart");
-  if(!ctx) return;
-  historyChart = new Chart(ctx, {
-    type: "line",
-    data: {
-      labels: [],
-      datasets: [{
-        label: "RMSSD",
-        data: [],
-        pointRadius: 2,
-        borderWidth: 2,
-        tension: 0.25
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { display: false },
-        y: { display: true, ticks: { color: "#95a3b7" } }
-      }
-    }
-  });
 }
 
 function setupDurationButtons(){
@@ -181,64 +179,34 @@ function buildCards(metrics){
   if(metrics.error){
     const c = document.createElement("div");
     c.className = "card bad";
-    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / repetí</div>`;
+    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / movimiento</div>`;
     cards.appendChild(c);
     return;
   }
 
-  const art = Number(metrics.artifact_percent);
-  const rec = Number(metrics.recovery_score);
-
-  // Cards “hero”
-  const hero = [
-    {k:"RMSSD", v: metrics.rmssd, u:"ms", cls:"hero"},
-    {k:"Recovery", v: rec, u:"/100", cls:"hero"},
-    {k:"HR media", v: metrics.hr_mean_bpm, u:"bpm", cls:""},
-    {k:"Calidad", v: (Number.isFinite(art)? (100 - Math.min(100, art)) : null), u:"%", cls:""},
-  ];
-
-  hero.forEach(it=>{
-    const num = typeof it.v === "number" ? it.v : Number(it.v);
-    const isNum = Number.isFinite(num);
-    const val = isNum ? num.toFixed(it.k==="Recovery" ? 0 : 2) : "—";
-
-    let cls = "card " + (it.cls || "");
-    if(it.k === "Calidad" && isNum){
-      if(num >= 92) cls += " good";
-      else if(num >= 82) cls += " warn";
-      else cls += " bad";
-    }
-    if(it.k === "Recovery" && isNum){
-      if(num >= 70) cls += " good";
-      else if(num >= 45) cls += " warn";
-      else cls += " bad";
-    }
-
-    const c = document.createElement("div");
-    c.className = cls.trim();
-    c.innerHTML = `<div class="k">${it.k}</div><div class="v">${val}</div><div class="u">${it.u}</div>`;
-    cards.appendChild(c);
-  });
-
   const items = [
-    {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)"},
+    {k:"HRV score", v: metrics.hrv_score, u:"/100"},
+    {k:"HR media", v: metrics.hr_mean, u:"bpm"},
+    {k:"HR máxima", v: metrics.hr_max, u:"bpm"},
+    {k:"RMSSD", v: metrics.rmssd, u:"ms"},
+
     {k:"SDNN", v: metrics.sdnn, u:"ms"},
+    {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)"},
     {k:"pNN50", v: metrics.pnn50, u:"%"},
     {k:"Mean RR", v: metrics.mean_rr, u:"ms"},
-    {k:"HR mín", v: metrics.hr_min_bpm, u:"bpm"},
-    {k:"HR máx", v: metrics.hr_max_bpm, u:"bpm"},
-    {k:"Resp", v: metrics.resp_rate_rpm, u:"rpm"},
-    {k:"LF", v: metrics.lf_power, u:"ms²"},
-    {k:"HF", v: metrics.hf_power, u:"ms²"},
+
+    {k:"LF Power", v: metrics.lf_power, u:"ms²"},
+    {k:"HF Power", v: metrics.hf_power, u:"ms²"},
     {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
-    {k:"TP", v: metrics.total_power, u:"ms²"},
+    {k:"Total Power", v: metrics.total_power, u:"ms²"},
+
     {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
   ];
 
   items.forEach(it => {
     const num = typeof it.v === "number" ? it.v : Number(it.v);
     const isNum = Number.isFinite(num);
-    const val = isNum ? num.toFixed(3) : "—";
+    const val = isNum ? num.toFixed(2) : "—";
 
     let cls = "card";
     if(it.k === "Artefactos" && isNum){
@@ -252,17 +220,10 @@ function buildCards(metrics){
     c.innerHTML = `<div class="k">${it.k}</div><div class="v">${val}</div><div class="u">${it.u}</div>`;
     cards.appendChild(c);
   });
-
-  // Cámara: si backend marca ppg_quality, lo mostramos en estado
-  if(metrics.sensor_type === "camera_ppg" && metrics.ppg_quality){
-    if(metrics.ppg_quality === "good") setStatus("Cálculo OK • Cámara (calidad buena)", "ok");
-    else if(metrics.ppg_quality === "moderate") setStatus("Cálculo OK • Cámara (calidad moderada)", "warn");
-    else setStatus("Cálculo OK • Cámara (calidad baja)", "bad");
-  }
 }
 
 // ----------------------------
-// Cámara PPG (más estable, menos estricta)
+// Cámara PPG (menos estricta)
 // ----------------------------
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
@@ -275,7 +236,7 @@ async function startCameraPPG(){
   mediaStream = await navigator.mediaDevices.getUserMedia({
     video: {
       facingMode: { ideal: "environment" },
-      frameRate: { ideal: 60, min: 30 },
+      frameRate: { ideal: 60, min: 24 },
       width: { ideal: 1280 },
       height: { ideal: 720 }
     },
@@ -285,16 +246,18 @@ async function startCameraPPG(){
   videoEl.srcObject = mediaStream;
   videoEl.playsInline = true;
   videoEl.muted = true;
+
   try { await videoEl.play(); } catch(_e) {}
 
   const t0 = Date.now();
   while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
     await new Promise(r => setTimeout(r, 50));
   }
-  if (videoEl.videoWidth === 0) {
-    throw new Error("Cámara autorizada pero sin frames. Probá Chrome y revisá permisos.");
+  if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
+    throw new Error("Cámara autorizada pero sin frames.");
   }
 
+  // Torch si existe
   let torchOn = false;
   const track = mediaStream.getVideoTracks()[0];
   try{
@@ -305,45 +268,36 @@ async function startCameraPPG(){
     }
   }catch(_e){}
 
-  const w = 200, h = 200;
+  const w = 160, h = 120;
   frameCanvas.width = w;
   frameCanvas.height = h;
 
-  setStatus(torchOn ? "Cámara activa (torch) • Tomando PPG" : "Cámara activa • Tomando PPG", "ok");
+  setStatus(torchOn ? "Cámara + torch ON • recolectando PPG" : "Cámara activa • recolectando PPG", torchOn ? "ok" : "warn");
 
   const intervalMs = Math.round(1000 / targetFps);
 
   let runningMean = null;
-  let runningVar = 1;
 
   cameraLoopHandle = setInterval(() => {
     if(!measuring) return;
 
-    const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
-    const sx = Math.max(0, Math.floor(vw/2 - 150));
-    const sy = Math.max(0, Math.floor(vh/2 - 150));
-    const sw = Math.min(300, vw - sx);
-    const sh = Math.min(300, vh - sy);
-
-    frameCtx.drawImage(videoEl, sx, sy, sw, sh, 0, 0, w, h);
+    frameCtx.drawImage(videoEl, 0, 0, w, h);
     const img = frameCtx.getImageData(0, 0, w, h).data;
 
     let sumR = 0;
     for(let i=0; i<img.length; i+=4) sumR += img[i];
     const meanR = sumR / (img.length / 4);
-    if(!Number.isFinite(meanR)) return;
 
     if (runningMean === null) runningMean = meanR;
-    runningMean = 0.98 * runningMean + 0.02 * meanR;
+    runningMean = 0.97 * runningMean + 0.03 * meanR;
 
     const ac = meanR - runningMean;
-    runningVar = 0.98 * runningVar + 0.02 * (ac*ac);
-    const sd = Math.sqrt(Math.max(runningVar, 1e-6));
 
-    const normalized = ac / sd;
+    // gráfico: amplificado
+    pushChartPoint(ac * 80);
 
-    // “ECG-like” visual
-    pushChartPoint(normalized * 25);
+    // backend: señal normalizada (AC/DC)
+    const normalized = (runningMean !== 0) ? (ac / runningMean) : 0;
 
     ppgSamples.push(normalized);
     ppgTimestamps.push(performance.now());
@@ -398,9 +352,8 @@ async function connectPolarH10(){
     throw new Error("Web Bluetooth no disponible en este navegador.");
   }
 
-  setStatus("Buscando Polar H10…", "warn");
+  setStatus("Emparejando Polar H10…", "warn");
 
-  // NO iniciar test hasta emparejar: acá se empareja primero
   bleDevice = await navigator.bluetooth.requestDevice({
     filters: [{ services: ["heart_rate"] }]
   });
@@ -423,12 +376,12 @@ async function connectPolarH10(){
     if(rrs.length){
       rrs.forEach(rr => {
         rrIntervalsMs.push(rr);
-        pushChartPoint(rr);
+        pushChartPoint(rr); // RR curve
       });
     }
   });
 
-  setStatus("Polar H10 conectado • recolectando RR", "ok");
+  setStatus("Polar conectado • recolectando RR", "ok");
 }
 
 async function startPolarH10(){
@@ -449,56 +402,62 @@ async function stopPolarH10(){
 }
 
 // ----------------------------
-// Historial alumno
+// Tendencias (CSV history)
 // ----------------------------
-async function loadStudentHistory(){
-  const studentId = (document.getElementById("studentId").value || "").trim();
-  const hint = document.getElementById("historyHint");
-  if(!historyChart){
-    return;
-  }
-  if(!studentId){
-    hint.textContent = "Ingresá un ID para ver evolución.";
-    historyChart.data.labels = [];
-    historyChart.data.datasets[0].data = [];
-    historyChart.update("none");
-    return;
-  }
+async function loadTrend(){
+  const studentId = document.getElementById("studentId").value.trim();
+  if(!studentId || !trendChart) return;
+
   try{
     const res = await fetch(`/api/history?student_id=${encodeURIComponent(studentId)}`);
-    const out = await res.json();
-    const rows = out.rows || [];
-    if(!rows.length){
-      hint.textContent = "Sin registros previos para este alumno.";
-      historyChart.data.labels = [];
-      historyChart.data.datasets[0].data = [];
-      historyChart.update("none");
-      return;
-    }
-    hint.textContent = `Últimos ${rows.length} tests (máx 50).`;
-    historyChart.data.labels = rows.map(r => r.timestamp_utc || "");
-    historyChart.data.datasets[0].data = rows.map(r => Number(r.rmssd));
-    historyChart.update("none");
-  }catch(e){
-    hint.textContent = "No se pudo cargar historial.";
-  }
+    const data = await res.json();
+    if(!data.ok) return;
+
+    const items = data.items || [];
+    const labels = items.map(x => (x.t || "").slice(5,10)); // MM-DD
+    const rmssd = items.map(x => Number(x.rmssd));
+    const hr = items.map(x => Number(x.hr_mean));
+    const score = items.map(x => Number(x.hrv_score));
+
+    trendChart.data.labels = labels;
+    trendChart.data.datasets[0].data = rmssd.map(v => Number.isFinite(v) ? v : null);
+    trendChart.data.datasets[1].data = hr.map(v => Number.isFinite(v) ? v : null);
+    trendChart.data.datasets[2].data = score.map(v => Number.isFinite(v) ? v : null);
+    trendChart.update("none");
+  }catch(_e){}
 }
 
 // ----------------------------
-// Medición: start/stop/compute/save
+// Medición (NO arranca timer hasta que conecte)
 // ----------------------------
 async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
 
-  measuring = true;
-  startedAt = Date.now();
-  enableControls();
-  setSensorChip();
-
+  // Reset charts
   chart.data.labels = [];
   chart.data.datasets[0].data = [];
   chart.update("none");
+
+  setSensorChip();
+
+  if(sensorType === "polar_h10"){
+    // conectar primero, recién después inicia timer/medición
+    measuring = false;
+    enableControls();
+    await startPolarH10();
+  }
+
+  if(sensorType === "camera_ppg"){
+    measuring = false;
+    enableControls();
+    await startCameraPPG();
+  }
+
+  // Ahora sí empieza medición real
+  measuring = true;
+  startedAt = Date.now();
+  enableControls();
 
   if(timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(async () => {
@@ -509,11 +468,7 @@ async function startMeasurement(){
     }
   }, 250);
 
-  if(sensorType === "camera_ppg"){
-    await startCameraPPG();
-  } else {
-    await startPolarH10();
-  }
+  setTimerText();
 }
 
 async function stopMeasurement(){
@@ -534,7 +489,7 @@ async function stopMeasurement(){
     await stopPolarH10();
   }
 
-  setStatus("Procesando HRV…", "warn");
+  setStatus("Procesando…", "warn");
 
   let payload = {
     sensor_type: sensorType,
@@ -570,16 +525,18 @@ async function stopMeasurement(){
 
     if(metrics.error){
       setStatus("Error en cálculo (ver tarjetas)", "bad");
-    } else if(metrics.sensor_type === "polar_h10") {
+    } else {
       const art = Number(metrics.artifact_percent);
       if(Number.isFinite(art)){
-        if(art <= 5) setStatus("Polar OK • Calidad buena", "ok");
-        else if(art <= 12) setStatus("Polar OK • Calidad moderada", "warn");
-        else setStatus("Polar OK • Calidad baja", "bad");
+        if(art <= 5) setStatus("OK • Calidad buena", "ok");
+        else if(art <= 12) setStatus("OK • Calidad moderada", "warn");
+        else setStatus("OK • Calidad baja (artefactos altos)", "bad");
       } else {
-        setStatus("Polar OK", "ok");
+        setStatus("OK", "ok");
       }
     }
+
+    await loadTrend();
   }catch(e){
     lastMetrics = { error: e.message || String(e) };
     buildCards(lastMetrics);
@@ -618,8 +575,8 @@ async function saveResult(){
     });
     const out = await res.json();
     if(out.ok){
-      setStatus("Guardado OK • dataset actualizado", "ok");
-      await loadStudentHistory();
+      setStatus("Guardado OK • CSV actualizado", "ok");
+      await loadTrend();
     } else {
       setStatus("No se pudo guardar", "bad");
     }
@@ -631,16 +588,15 @@ async function saveResult(){
 // ----------------------------
 // Init
 // ----------------------------
-window.addEventListener("DOMContentLoaded", () => {
+window.addEventListener("DOMContentLoaded", async () => {
   initChart();
-  initHistoryChart();
+  initTrendChart();
   setupDurationButtons();
   setupSensorSelector();
   setSensorChip();
   enableControls();
   buildCards(null);
-
-  document.getElementById("studentId").addEventListener("change", loadStudentHistory);
+  await loadTrend();
 
   document.getElementById("btnStart").addEventListener("click", async () => {
     if(measuring) return;
@@ -659,5 +615,9 @@ window.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("btnSave").addEventListener("click", async () => {
     await saveResult();
+  });
+
+  document.getElementById("studentId").addEventListener("change", async () => {
+    await loadTrend();
   });
 });
