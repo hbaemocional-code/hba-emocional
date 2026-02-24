@@ -29,15 +29,47 @@ def _finite_array(x):
     return x[np.isfinite(x)]
 
 
-def _safe_div(a, b):
+def sanitize_for_json(obj):
+    """
+    Convierte valores no-JSON (NaN, inf, -inf, numpy scalars) a tipos JSON-safe.
+    - NaN/inf -> None (null)
+    - np scalar -> python scalar
+    - dict/list -> recursivo
+    """
+    if obj is None:
+        return None
+
+    # numpy scalar -> python scalar
+    if isinstance(obj, (np.generic,)):
+        obj = obj.item()
+
+    # floats: NaN/Inf no son JSON válidos
+    if isinstance(obj, float):
+        if not np.isfinite(obj):
+            return None
+        return obj
+
+    # ints/bools/str ok
+    if isinstance(obj, (int, bool, str)):
+        return obj
+
+    # dict
+    if isinstance(obj, dict):
+        return {str(k): sanitize_for_json(v) for k, v in obj.items()}
+
+    # list/tuple
+    if isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+
+    # fallback: intentar convertir a string si no es serializable
     try:
-        a = float(a)
-        b = float(b)
-        if not np.isfinite(a) or not np.isfinite(b) or b == 0:
-            return np.nan
-        return a / b
+        # pandas NA
+        if pd.isna(obj):
+            return None
     except Exception:
-        return np.nan
+        pass
+
+    return obj
 
 
 # ============================
@@ -125,20 +157,16 @@ def hrv_score_from_lnrmssd(lnrmssd: float):
     """
     HRV_Score (0-100) heurístico para dashboard.
     Basado en lnRMSSD, mapeado linealmente y acotado.
-    No es estándar clínico, pero es estable y comparable intra-sujeto.
     """
     if lnrmssd is None or not np.isfinite(lnrmssd):
         return np.nan
-    # rango típico lnRMSSD ~ [2.5, 5.0] aprox. (muy general)
     score = (lnrmssd - 2.5) / (5.0 - 2.5) * 100.0
     return float(np.clip(score, 0.0, 100.0))
 
 
 def resp_rate_from_hf_peak(hrv_freq_df: pd.DataFrame):
     """
-    Estima frecuencia respiratoria (resp_rate_rpm) usando el pico HF del espectro.
-    Muchos outputs de nk.hrv_frequency incluyen HRV_HF_Peak.
-    Si no está disponible, devuelve NaN.
+    Estima frecuencia respiratoria (rpm) usando el pico HF si NK lo provee.
     """
     try:
         if "HRV_HF_Peak" in hrv_freq_df.columns:
@@ -157,10 +185,6 @@ def resp_rate_from_hf_peak(hrv_freq_df: pd.DataFrame):
 def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
     """
     HRV desde RR (ms) - Polar H10.
-    Time: RMSSD, SDNN, lnRMSSD, pNN50, Mean RR.
-    Freq: LF, HF, LF/HF, Total Power.
-    Calidad: % artefactos detectados/corregidos.
-    Extras: FC media/min/max y respiración estimada (si HF_Peak disponible).
     """
     rri_ms = _finite_array(rri_ms)
 
@@ -172,7 +196,6 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
 
     rri_clean, artifact_percent, mask_art = clean_rri_ms(rri_ms)
 
-    # NeuroKit2 (try directo con rri=..., fallback a peaks)
     try:
         hrv_time = nk.hrv_time(rri=rri_clean, show=False)
         hrv_freq = nk.hrv_frequency(rri=rri_clean, show=False)
@@ -203,20 +226,15 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
     tp = g(hrv_freq, "HRV_TP")
     lfhf = (lf / hf) if np.isfinite(lf) and np.isfinite(hf) and hf > 0 else np.nan
 
-    # Extras FC
     hr_series = 60000.0 / rri_clean
     hr_series = hr_series[np.isfinite(hr_series)]
     hr_mean_bpm = float(np.mean(hr_series)) if len(hr_series) else np.nan
     hr_min_bpm = float(np.min(hr_series)) if len(hr_series) else np.nan
     hr_max_bpm = float(np.max(hr_series)) if len(hr_series) else np.nan
 
-    # HRV "valor" para dashboard
     hrv_score = hrv_score_from_lnrmssd(lnrmssd)
-
-    # Respiración estimada (si el espectro entrega HF_Peak)
     resp_rate_rpm = resp_rate_from_hf_peak(hrv_freq)
 
-    # Bandera de estabilidad espectral (por duración)
     freq_warning = None
     if duration_minutes is not None:
         try:
@@ -240,7 +258,6 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
         "n_rr": int(len(rri_clean)),
         "freq_warning": freq_warning,
 
-        # NUEVOS (no rompen nada)
         "hr_mean_bpm": hr_mean_bpm,
         "hr_min_bpm": hr_min_bpm,
         "hr_max_bpm": hr_max_bpm,
@@ -251,46 +268,35 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
 
 def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes=None):
     """
-    HRV desde PPG (cámara): procesa señal y detecta picos, corrige picos y reporta artefactos.
-    Extras: FC media/min/max y respiración estimada (si HF_Peak disponible).
+    HRV desde PPG (cámara).
     """
     ppg = _finite_array(ppg)
 
     if sampling_rate is None or not np.isfinite(sampling_rate) or sampling_rate <= 1:
         return {"error": "sampling_rate inválido."}
 
-    # ---------------------------------------------------------
-    # VALIDACIONES SEGURAS (solo para no romper con señal mala)
-    # ---------------------------------------------------------
-    # 1) mínimo absoluto para que nk.ppg_process tenga base
-    if len(ppg) < int(sampling_rate * 30):  # 30s reales
+    # Validaciones seguras (para evitar crasheos / basura)
+    if len(ppg) < int(sampling_rate * 30):
         return {"error": "PPG insuficiente (<30s efectivos). Tapá completamente el lente y repetí 3–5 min."}
 
-    # 2) señal casi plana (muy común cuando el navegador/cámara no da PPG usable)
     if len(ppg) > 10 and np.nanstd(ppg) < 1e-6:
         return {"error": "Señal PPG sin variación detectable. Probá con más luz, cámara trasera y dedo fijo."}
 
-    # Recomendación: para HRV y especialmente frecuencia, ideal 3-5 min.
-    min_seconds = 60  # mínimo absoluto (evitar resultados sin base)
+    min_seconds = 60
     if len(ppg) < int(sampling_rate * min_seconds):
         return {"error": f"PPG insuficiente (mínimo {min_seconds}s). Recomendado 3–5 min."}
 
     try:
         signals, info = nk.ppg_process(ppg, sampling_rate=sampling_rate)
         peaks = info.get("PPG_Peaks", None)
-
-        # Normalizamos a array binario si viniera distinto
         if peaks is None:
             peaks, _ = nk.ppg_peaks(ppg, sampling_rate=sampling_rate)
     except Exception as e:
         return {"error": f"Fallo en procesamiento PPG: {str(e)}"}
 
-    # Corrección de picos con NK (más robusto que “contar picos”)
     try:
         fixed = nk.signal_fixpeaks(peaks, sampling_rate=sampling_rate, iterative=True, show=False)
         peaks_fixed = fixed["Peaks"]
-
-        # Estimar % artefactos en base a correcciones:
         idx_before = np.where(np.asarray(peaks) == 1)[0]
         idx_after = np.where(np.asarray(peaks_fixed) == 1)[0]
         if len(idx_before) == 0:
@@ -300,13 +306,11 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
             set_a = set(idx_after.tolist())
             changed = len(set_b.symmetric_difference(set_a))
             artifact_percent = 100.0 * (changed / max(len(set_b), 1))
-
         peaks_for_hrv = peaks_fixed
     except Exception:
         artifact_percent = np.nan
         peaks_for_hrv = peaks
 
-    # HRV
     try:
         hrv_time = nk.hrv_time(peaks_for_hrv, sampling_rate=sampling_rate, show=False)
         hrv_freq = nk.hrv_frequency(peaks_for_hrv, sampling_rate=sampling_rate, show=False)
@@ -330,20 +334,15 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     tp = g(hrv_freq, "HRV_TP")
     lfhf = (lf / hf) if np.isfinite(lf) and np.isfinite(hf) and hf > 0 else np.nan
 
-    # Extras FC (desde picos)
     rri_est = peaks_to_rri_ms(np.asarray(peaks_for_hrv), sampling_rate=float(sampling_rate))
     rri_est = _finite_array(rri_est)
     hr_series = 60000.0 / rri_est
     hr_series = hr_series[np.isfinite(hr_series)]
-
     hr_mean_bpm = float(np.mean(hr_series)) if len(hr_series) else np.nan
     hr_min_bpm = float(np.min(hr_series)) if len(hr_series) else np.nan
     hr_max_bpm = float(np.max(hr_series)) if len(hr_series) else np.nan
 
-    # HRV "valor" para dashboard
     hrv_score = hrv_score_from_lnrmssd(lnrmssd)
-
-    # Respiración estimada (si el espectro entrega HF_Peak)
     resp_rate_rpm = resp_rate_from_hf_peak(hrv_freq)
 
     freq_warning = None
@@ -370,7 +369,6 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
         "sampling_rate": float(sampling_rate),
         "freq_warning": freq_warning,
 
-        # NUEVOS (no rompen nada)
         "hr_mean_bpm": hr_mean_bpm,
         "hr_min_bpm": hr_min_bpm,
         "hr_max_bpm": hr_max_bpm,
@@ -391,7 +389,6 @@ CSV_COLUMNS = [
     "sensor_type",
     "duration_minutes",
 
-    # HRV existentes
     "rmssd",
     "sdnn",
     "lnrmssd",
@@ -404,7 +401,6 @@ CSV_COLUMNS = [
     "artifact_percent",
     "freq_warning",
 
-    # NUEVOS (sin romper compatibilidad)
     "hr_mean_bpm",
     "hr_min_bpm",
     "hr_max_bpm",
@@ -420,7 +416,6 @@ def append_to_dataset(row: dict):
 
     if os.path.exists(DATASET_FILE):
         df = pd.read_csv(DATASET_FILE)
-        # asegurar columnas
         for c in CSV_COLUMNS:
             if c not in df.columns:
                 df[c] = ""
@@ -453,7 +448,7 @@ def api_compute():
         result = compute_hrv_from_rri(np.array(rri_ms, dtype=float), duration_minutes=duration_minutes)
         result["sensor_type"] = "polar_h10"
         result["duration_minutes"] = duration_minutes
-        return jsonify(result)
+        return jsonify(sanitize_for_json(result))
 
     if sensor_type == "camera_ppg":
         ppg = payload.get("ppg", [])
@@ -461,7 +456,7 @@ def api_compute():
         result = compute_hrv_from_ppg(np.array(ppg, dtype=float), float(sampling_rate), duration_minutes=duration_minutes)
         result["sensor_type"] = "camera_ppg"
         result["duration_minutes"] = duration_minutes
-        return jsonify(result)
+        return jsonify(sanitize_for_json(result))
 
     return jsonify({"error": "sensor_type inválido. Use 'camera_ppg' o 'polar_h10'."}), 400
 
@@ -476,6 +471,7 @@ def api_save():
     notes = str(payload.get("notes", "")).strip()
 
     metrics = payload.get("metrics", {}) or {}
+    metrics = sanitize_for_json(metrics)  # por si llega con NaN/null raros
 
     row = {
         "timestamp_utc": datetime.utcnow().isoformat() + "Z",
@@ -485,7 +481,6 @@ def api_save():
         "sensor_type": metrics.get("sensor_type", ""),
         "duration_minutes": metrics.get("duration_minutes", ""),
 
-        # existentes
         "rmssd": metrics.get("rmssd", ""),
         "sdnn": metrics.get("sdnn", ""),
         "lnrmssd": metrics.get("lnrmssd", ""),
@@ -498,7 +493,6 @@ def api_save():
         "artifact_percent": metrics.get("artifact_percent", ""),
         "freq_warning": metrics.get("freq_warning", ""),
 
-        # nuevos
         "hr_mean_bpm": metrics.get("hr_mean_bpm", ""),
         "hr_min_bpm": metrics.get("hr_min_bpm", ""),
         "hr_max_bpm": metrics.get("hr_max_bpm", ""),
