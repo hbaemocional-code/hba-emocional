@@ -6,13 +6,13 @@ import pandas as pd
 from flask import Flask, render_template, request, jsonify
 import neurokit2 as nk
 from scipy import interpolate
+from scipy.signal import butter, filtfilt
 
 app = Flask(__name__)
 
 # ============================
-# Persistencia: CSV path (Render Disk friendly)
+# Persistencia CSV (Render-safe)
 # ============================
-# En Render, montá un Persistent Disk y seteá DATASET_DIR=/var/data
 DATASET_DIR = os.environ.get("DATASET_DIR", "").strip()
 if DATASET_DIR:
     os.makedirs(DATASET_DIR, exist_ok=True)
@@ -37,10 +37,7 @@ def _finite_array(x):
 
 
 def sanitize_for_json(obj):
-    """
-    JSON no permite NaN/Inf. Convertimos a None (null).
-    También np scalars -> python scalars.
-    """
+    """JSON no permite NaN/Inf. Convertimos a None (null)."""
     if obj is None:
         return None
 
@@ -76,11 +73,10 @@ def sanitize_for_json(obj):
 
 def clean_rri_ms(rri_ms: np.ndarray):
     """
-    Limpieza/corrección de RR (ms) para estudio:
-    - Rechazo fisiológico: 300–2000 ms
-    - Outliers robustos (MAD)
-    - Corrección por interpolación lineal (mantiene longitud)
-    Devuelve: rri_clean, artifact_percent, mask_artifact
+    Limpieza/corrección RR (ms):
+    - Rango fisiológico 300–2000
+    - Outliers MAD
+    - Interpolación lineal para corregir
     """
     rri_ms = _finite_array(rri_ms)
 
@@ -142,9 +138,7 @@ def peaks_to_rri_ms(peaks: np.ndarray, sampling_rate: float):
 
 
 def hrv_score_from_lnrmssd(lnrmssd: float):
-    """
-    Score heurístico 0–100 SOLO para Polar (validación).
-    """
+    """Score 0–100 SOLO para Polar (heurístico)."""
     if lnrmssd is None or not np.isfinite(lnrmssd):
         return np.nan
     score = (lnrmssd - 2.5) / (5.0 - 2.5) * 100.0
@@ -152,9 +146,6 @@ def hrv_score_from_lnrmssd(lnrmssd: float):
 
 
 def resp_rate_from_hf_peak(hrv_freq_df: pd.DataFrame):
-    """
-    Estima respiración (rpm) usando HF_Peak si NeuroKit lo entrega.
-    """
     try:
         if "HRV_HF_Peak" in hrv_freq_df.columns:
             hf_peak_hz = _as_float(hrv_freq_df["HRV_HF_Peak"].iloc[0])
@@ -166,19 +157,14 @@ def resp_rate_from_hf_peak(hrv_freq_df: pd.DataFrame):
 
 
 # ============================
-# HRV Core (reutilizable)
+# HRV Core (RR limpio)
 # ============================
 
 def _compute_hrv_from_clean_rri(rri_clean: np.ndarray, artifact_percent: float, duration_minutes=None):
-    """
-    Motor común: HRV desde RR limpio.
-    Devuelve dict con métricas HRV + FC + resp_rate.
-    """
     try:
         hrv_time = nk.hrv_time(rri=rri_clean, show=False)
         hrv_freq = nk.hrv_frequency(rri=rri_clean, show=False)
     except Exception:
-        # fallback a peaks si hiciera falta
         peaks = rri_to_peaks(rri_clean, sampling_rate=1000)
         if peaks is None:
             return {
@@ -244,129 +230,152 @@ def _compute_hrv_from_clean_rri(rri_clean: np.ndarray, artifact_percent: float, 
 
 
 # ============================
-# HRV por sensor (separados)
+# HRV por sensor
 # ============================
 
 def compute_hrv_from_rri_polar(rri_ms: np.ndarray, duration_minutes=None):
-    """
-    Polar H10 (Gold Standard): RR -> clean -> HRV.
-    """
     rri_ms = _finite_array(rri_ms)
     if len(rri_ms) < 20:
-        return {"error": "Polar: Insuficientes intervalos RR (mínimo recomendado: 20).", "artifact_percent": np.nan, "n_rr": 0}
+        return {"error": "Polar: Insuficientes RR (mínimo recomendado: 20).", "artifact_percent": np.nan, "n_rr": 0}
 
-    rri_clean, artifact_percent, _mask = clean_rri_ms(rri_ms)
+    rri_clean, artifact_percent, _ = clean_rri_ms(rri_ms)
     out = _compute_hrv_from_clean_rri(rri_clean, artifact_percent, duration_minutes=duration_minutes)
 
-    # Score SOLO para Polar
-    lnrmssd = out.get("lnrmssd", np.nan)
-    out["hrv_score"] = hrv_score_from_lnrmssd(lnrmssd)
-
-    # flags comunes
+    out["hrv_score"] = hrv_score_from_lnrmssd(out.get("lnrmssd", np.nan))
     out["ppg_valid"] = None
     out["ppg_quality"] = None
     return out
 
 
 def compute_hrv_from_rri_garmin(rri_ms: np.ndarray, duration_minutes=None):
-    """
-    Garmin HRM: RR -> clean -> HRV.
-    (separado para permitir tuning futuro sin afectar Polar)
-    """
     rri_ms = _finite_array(rri_ms)
     if len(rri_ms) < 20:
-        return {"error": "Garmin: Insuficientes intervalos RR (mínimo recomendado: 20).", "artifact_percent": np.nan, "n_rr": 0}
+        return {"error": "Garmin: Insuficientes RR (mínimo recomendado: 20).", "artifact_percent": np.nan, "n_rr": 0}
 
-    # Por ahora, misma limpieza que Polar; queda separado para ajustar luego.
-    rri_clean, artifact_percent, _mask = clean_rri_ms(rri_ms)
+    rri_clean, artifact_percent, _ = clean_rri_ms(rri_ms)
 
-    # Quality gate suave para Garmin (podés tunearlo después)
-    if np.isfinite(artifact_percent) and artifact_percent > 25.0:
-        out = {
-            "error": "Garmin: Calidad RR baja (artefactos > 25%). Ajustá banda/posición y repetí.",
+    # Garmin separado: hoy mismo cleaning, mañana lo ajustás sin tocar Polar.
+    if np.isfinite(artifact_percent) and artifact_percent > 30.0:
+        return {
+            "error": "Garmin: Calidad RR baja (artefactos > 30%). Ajustá banda/posición y repetí.",
             "artifact_percent": artifact_percent,
             "n_rr": int(len(rri_clean)),
+            "hrv_score": None,
+            "ppg_valid": None,
+            "ppg_quality": None
         }
-        out["hrv_score"] = None
-        out["ppg_valid"] = None
-        out["ppg_quality"] = None
-        return out
 
     out = _compute_hrv_from_clean_rri(rri_clean, artifact_percent, duration_minutes=duration_minutes)
-
-    # Garmin: NO score 0-100 (lo dejamos reservado a Polar)
     out["hrv_score"] = None
-
     out["ppg_valid"] = None
     out["ppg_quality"] = None
     return out
 
 
+def _bandpass_ppg(x, fs, low=0.7, high=4.0, order=3):
+    """
+    Banda típica PPG: 0.7–4.0 Hz (~42–240 bpm).
+    """
+    x = np.asarray(x, dtype=float)
+    if len(x) < int(fs * 10):
+        return x
+    nyq = 0.5 * fs
+    lowc = max(low / nyq, 1e-4)
+    highc = min(high / nyq, 0.999)
+    if highc <= lowc:
+        return x
+    b, a = butter(order, [lowc, highc], btype="band")
+    return filtfilt(b, a, x)
+
+
 def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes=None):
     """
-    Cámara PPG:
-    - PPG -> peaks -> RR -> clean -> HRV desde rri
-    - Quality Gate: si artefactos > 20% no devolvemos HRV
+    NUEVO (robusto, menos rígido):
+    - Preprocesa: detrend/normaliza + bandpass 0.7–4 Hz
+    - Detecta picos de forma más robusta
+    - Construye RR y SIEMPRE devuelve FC si hay RR suficiente
+    - HRV SOLO si calidad aceptable, pero sin bloquear la toma
     """
     ppg = _finite_array(ppg)
 
-    if sampling_rate is None or not np.isfinite(sampling_rate) or sampling_rate <= 1:
+    if sampling_rate is None or not np.isfinite(sampling_rate) or sampling_rate <= 5:
         return {"error": "sampling_rate inválido.", "ppg_valid": False, "ppg_quality": None, "n_rr": 0}
 
-    if len(ppg) < int(sampling_rate * 30):
-        return {"error": "PPG insuficiente (<30s). Repetí 3–5 min.", "ppg_valid": False, "ppg_quality": None, "n_rr": 0}
+    # cámara: mínimo razonable para poder sacar FC (no HRV espectral estable)
+    if len(ppg) < int(sampling_rate * 20):
+        return {"error": "PPG insuficiente (<20s).", "ppg_valid": False, "ppg_quality": None, "n_rr": 0}
 
-    if len(ppg) > 10 and np.nanstd(ppg) < 1e-6:
-        return {"error": "Señal PPG sin variación. Más luz/torch + dedo fijo.", "ppg_valid": False, "ppg_quality": None, "n_rr": 0}
+    # Normalización robusta (evita que la señal “chica” parezca plana)
+    ppg = ppg - np.nanmedian(ppg)
+    mad = np.nanmedian(np.abs(ppg - np.nanmedian(ppg))) + 1e-9
+    ppg = ppg / mad
 
-    if len(ppg) < int(sampling_rate * 60):
-        return {"error": "PPG insuficiente (<60s). Recomendado 3–5 min.", "ppg_valid": False, "ppg_quality": None, "n_rr": 0}
-
-    # PPG -> peaks
+    # Filtrado banda cardíaca
     try:
-        _signals, info = nk.ppg_process(ppg, sampling_rate=sampling_rate)
-        peaks = info.get("PPG_Peaks", None)
-        if peaks is None:
-            peaks, _ = nk.ppg_peaks(ppg, sampling_rate=sampling_rate)
-    except Exception as e:
-        return {"error": f"Fallo en procesamiento PPG: {str(e)}", "ppg_valid": False, "ppg_quality": None, "n_rr": 0}
+        ppg_f = _bandpass_ppg(ppg, sampling_rate, low=0.7, high=4.0, order=3)
+    except Exception:
+        ppg_f = ppg
 
-    # Fix peaks
+    # Detectar picos (más tolerante)
+    peaks = None
+    try:
+        _, info = nk.ppg_process(ppg_f, sampling_rate=sampling_rate)
+        peaks = info.get("PPG_Peaks", None)
+    except Exception:
+        peaks = None
+
+    if peaks is None:
+        try:
+            peaks, _ = nk.ppg_peaks(ppg_f, sampling_rate=sampling_rate)
+        except Exception:
+            # fallback más genérico
+            try:
+                peaks, _ = nk.signal_findpeaks(ppg_f, sampling_rate=sampling_rate, method="nabian2018")
+                peaks = peaks.get("Peaks", None)
+            except Exception:
+                peaks = None
+
+    if peaks is None:
+        return {"error": "PPG: no se detectaron picos. Probá dedo más firme y torch.", "ppg_valid": False, "ppg_quality": None, "n_rr": 0}
+
+    # Fix peaks (si se puede)
     try:
         fixed = nk.signal_fixpeaks(peaks, sampling_rate=sampling_rate, iterative=True, show=False)
-        peaks_for_rr = np.asarray(fixed["Peaks"])
+        peaks = np.asarray(fixed["Peaks"])
     except Exception:
-        peaks_for_rr = np.asarray(peaks)
+        peaks = np.asarray(peaks)
 
     # Peaks -> RR
-    rri_est = peaks_to_rri_ms(peaks_for_rr, sampling_rate=float(sampling_rate))
+    rri_est = peaks_to_rri_ms(peaks, sampling_rate=float(sampling_rate))
     rri_est = _finite_array(rri_est)
 
-    if len(rri_est) < 20:
-        return {"error": "PPG: RR insuficiente. Mejorá luz/dedo y repetí.", "ppg_valid": False, "ppg_quality": None, "n_rr": 0}
+    if len(rri_est) < 10:
+        return {"error": "PPG: RR insuficiente. Ajustá dedo/torch y repetí.", "ppg_valid": False, "ppg_quality": None, "n_rr": int(len(rri_est))}
 
-    # RR clean
-    rri_clean, artifact_percent, _mask = clean_rri_ms(rri_est)
+    # Clean RR
+    rri_clean, artifact_percent, _ = clean_rri_ms(rri_est)
 
-    # Quality gate (cámara)
-    ppg_valid = True
-    if np.isfinite(artifact_percent) and artifact_percent > 20.0:
-        ppg_valid = False
-
-    ppg_quality = None
-    if np.isfinite(artifact_percent):
-        ppg_quality = float(np.clip(100.0 - artifact_percent, 0.0, 100.0))
-
-    # FC desde RR limpio (siempre la damos, aunque no haya HRV)
+    # Siempre devolver FC si hay RR
     hr_series = 60000.0 / rri_clean
     hr_series = hr_series[np.isfinite(hr_series)]
     hr_mean_bpm = float(np.mean(hr_series)) if len(hr_series) else np.nan
     hr_min_bpm = float(np.min(hr_series)) if len(hr_series) else np.nan
     hr_max_bpm = float(np.max(hr_series)) if len(hr_series) else np.nan
 
+    # Quality / validez (MUCHO menos rígido)
+    # - antes cortábamos en 20%: ahora dejamos 35% para HRV básica
+    ppg_quality = None
+    if np.isfinite(artifact_percent):
+        ppg_quality = float(np.clip(100.0 - artifact_percent, 0.0, 100.0))
+
+    ppg_valid = True
+    if np.isfinite(artifact_percent) and artifact_percent > 35.0:
+        ppg_valid = False
+
+    # Si FC es absurda, no damos HRV (pero sí devolvemos FC y el motivo)
     if np.isfinite(hr_mean_bpm) and (hr_mean_bpm < 35.0 or hr_mean_bpm > 180.0):
         return {
-            "error": "PPG: FC fuera de rango → picos incorrectos. Repetí.",
+            "error": "PPG: FC fuera de rango → picos inestables. Repetí con dedo fijo.",
             "artifact_percent": artifact_percent,
             "n_rr": int(len(rri_clean)),
             "hr_mean_bpm": hr_mean_bpm,
@@ -376,12 +385,13 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
             "ppg_quality": ppg_quality,
             "hrv_score": None,
             "resp_rate_rpm": None,
-            "freq_warning": "PPG no confiable."
+            "freq_warning": "PPG no confiable para HRV."
         }
 
+    # Si no es válido, devolvemos FC + calidad, pero NO HRV
     if not ppg_valid:
         return {
-            "error": "Calidad PPG baja (artefactos > 20%). Repetí: dedo fijo + torch + 5 min.",
+            "error": "PPG: señal ruidosa (artefactos altos). Se reporta FC pero HRV no confiable.",
             "artifact_percent": artifact_percent,
             "n_rr": int(len(rri_clean)),
             "hr_mean_bpm": hr_mean_bpm,
@@ -391,13 +401,14 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
             "ppg_quality": ppg_quality,
             "hrv_score": None,
             "resp_rate_rpm": None,
-            "freq_warning": "PPG con artefactos altos: HRV no confiable."
+            "freq_warning": "PPG ruidosa: HRV bloqueado por calidad."
         }
 
+    # Si es válido: HRV completo
     out = _compute_hrv_from_clean_rri(rri_clean, artifact_percent, duration_minutes=duration_minutes)
-    out["hrv_score"] = None  # cámara: no score 0-100
     out["ppg_valid"] = True
     out["ppg_quality"] = ppg_quality
+    out["hrv_score"] = None
     return out
 
 
@@ -514,10 +525,10 @@ def api_save():
     comorbidities = str(payload.get("comorbidities", "")).strip()
     notes = str(payload.get("notes", "")).strip()
 
-    metrics = payload.get("metrics", {}) or {}
-    metrics = sanitize_for_json(metrics)
+    metrics = sanitize_for_json(payload.get("metrics", {}) or {})
 
-    row = {
+    row = {c: "" for c in CSV_COLUMNS}
+    row.update({
         "timestamp_utc": datetime.utcnow().isoformat() + "Z",
         "student_id": student_id,
         "age": age,
@@ -550,7 +561,7 @@ def api_save():
         "ppg_quality": metrics.get("ppg_quality", ""),
 
         "notes": notes,
-    }
+    })
 
     append_to_dataset(row)
     return jsonify({"ok": True, "file": DATASET_FILE})
