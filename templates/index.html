@@ -1,3 +1,4 @@
+<!-- templates/index.html  (COMPLETO) -->
 <!doctype html>
 <html lang="es">
 <head>
@@ -11,10 +12,13 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <div class="brand-dot"></div>
+      <div class="brand-logo">
+        <!-- poné tu logo en /static/img/hba_logo.png -->
+        <img src="/static/img/hba_logo.png" alt="HBA" onerror="this.style.display='none';" />
+      </div>
       <div>
         <div class="brand-title">HBA Emocional</div>
-        <div class="brand-subtitle">HRV • Polar H10 / Cámara • Fase 1</div>
+        <div class="brand-subtitle">Plataforma de Monitoreo Autonómico • Rehabilitación</div>
       </div>
     </div>
 
@@ -26,7 +30,7 @@
 
   <main class="container">
     <section class="panel">
-      <h2>Configuración</h2>
+      <h2>Registro</h2>
 
       <div class="grid-2">
         <div class="field">
@@ -51,7 +55,7 @@
             <option value="camera_ppg">Cámara (PPG)</option>
             <option value="polar_h10">Polar H10 (BLE)</option>
           </select>
-          <div class="hint">Polar H10 requiere Chrome/Edge y HTTPS o localhost.</div>
+          <div class="hint">Polar H10 requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost.</div>
         </div>
 
         <div class="field">
@@ -60,19 +64,19 @@
             <button class="seg-btn active" data-min="3" id="dur3">3 min</button>
             <button class="seg-btn" data-min="5" id="dur5">5 min</button>
           </div>
-          <div class="hint">5 min recomendado para LF/HF más estable.</div>
+          <div class="hint">5 min recomendado para espectral (LF/HF) más estable.</div>
         </div>
       </div>
 
       <div class="actions">
-        <button class="btn primary" id="btnStart">Iniciar</button>
+        <button class="btn primary" id="btnStart">Iniciar Medición</button>
         <button class="btn" id="btnStop" disabled>Detener</button>
-        <button class="btn success" id="btnSave" disabled>Guardar</button>
+        <button class="btn success" id="btnSave" disabled>Guardar Resultado</button>
       </div>
 
       <div class="note">
         <label>Notas (opcional)</label>
-        <input id="notes" type="text" placeholder="Ej: descanso previo, medicación, etc." />
+        <input id="notes" type="text" placeholder="Ej: descanso previo, medicación, observaciones..." />
       </div>
     </section>
 
@@ -81,7 +85,7 @@
         <h2>Señal</h2>
         <div class="mini">
           <span class="chip" id="chipSensor">Sensor: Cámara (PPG)</span>
-          <span class="chip" id="chipTimer">00:00</span>
+          <span class="chip chip-strong" id="chipTimer">00:00</span>
         </div>
       </div>
 
@@ -101,18 +105,21 @@
 
       <div class="cards" id="cards"></div>
 
-      <div class="panel-head" style="margin-top:14px;">
-        <h2>Evolución Alumno</h2>
-        <div class="hint" id="historyHint"></div>
+      <div class="divider"></div>
+
+      <div class="panel-head">
+        <h2>Evolución del Alumno</h2>
+        <div class="hint">Se carga si existen mediciones guardadas en CSV.</div>
       </div>
-      <div class="chart-wrap" style="height:220px;">
-        <canvas id="historyChart"></canvas>
+
+      <div class="chart-wrap small">
+        <canvas id="trendChart"></canvas>
       </div>
     </section>
   </main>
 
   <footer class="footer">
-    <div>© HBA Emocional</div>
+    <div>© Método HBA • HBA Emocional</div>
     <div class="footer-hint">Uso científico / rehabilitación. No diagnóstico.</div>
   </footer>
 
