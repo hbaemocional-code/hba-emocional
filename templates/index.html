@@ -3,18 +3,25 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>HBA Emocional - Fase 1 (Datos)</title>
+  <title>HBA Emocional - Plataforma Autonómica</title>
+
   <link rel="stylesheet" href="/static/css/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 
 <body>
+
+  <!-- =========================
+        TOPBAR
+  ========================== -->
   <header class="topbar">
     <div class="brand">
       <div class="brand-dot"></div>
       <div>
         <div class="brand-title">HBA Emocional</div>
-        <div class="brand-subtitle">Recolección de HRV • Fase 1 (Datos)</div>
+        <div class="brand-subtitle">
+          Plataforma de Monitoreo Autonómico • Rehabilitación
+        </div>
       </div>
     </div>
 
@@ -25,7 +32,11 @@
   </header>
 
   <main class="container">
-    <section class="panel">
+
+    <!-- =========================
+          CONFIGURACIÓN
+    ========================== -->
+    <section class="panel panel-config">
       <h2>Configuración de Registro</h2>
 
       <div class="grid-2">
@@ -59,10 +70,12 @@
         <div class="field">
           <label>Duración</label>
           <div class="segmented">
-            <button class="seg-btn active" data-min="3" id="dur3">3 minutos</button>
-            <button class="seg-btn" data-min="5" id="dur5">5 minutos</button>
+            <button class="seg-btn active" id="dur3">3 minutos</button>
+            <button class="seg-btn" id="dur5">5 minutos</button>
           </div>
-          <div class="hint">5 min recomendado para espectral (LF/HF) más estable.</div>
+          <div class="hint">
+            5 min recomendado para análisis espectral más estable.
+          </div>
         </div>
       </div>
 
@@ -74,16 +87,19 @@
 
       <div class="note">
         <label>Notas (opcional)</label>
-        <input id="notes" type="text" placeholder="Ej: descanso 2 min previo, medicación, etc." />
+        <input id="notes" type="text" placeholder="Ej: descanso previo, medicación, observaciones..." />
       </div>
     </section>
 
-    <section class="panel">
+    <!-- =========================
+          SEÑAL EN TIEMPO REAL
+    ========================== -->
+    <section class="panel panel-signal">
       <div class="panel-head">
         <h2>Señal en Tiempo Real</h2>
         <div class="mini">
           <span class="chip" id="chipSensor">Sensor: Cámara (PPG)</span>
-          <span class="chip" id="chipTimer">00:00</span>
+          <span class="chip accent" id="chipTimer">00:00</span>
         </div>
       </div>
 
@@ -95,19 +111,32 @@
       <canvas id="frameCanvas" class="hidden"></canvas>
     </section>
 
-    <section class="panel">
+    <!-- =========================
+          RESULTADOS
+    ========================== -->
+    <section class="panel panel-results">
+
       <div class="panel-head">
-        <h2>Data Details</h2>
+        <h2>Resultados Fisiológicos</h2>
         <div class="hint" id="freqHint"></div>
       </div>
 
-      <div class="cards" id="cards"></div>
+      <!-- BLOQUE VITALS -->
+      <div class="section-title">Estado Autonómico</div>
+      <div class="cards vitals" id="cards"></div>
+
     </section>
+
   </main>
 
+  <!-- =========================
+        FOOTER
+  ========================== -->
   <footer class="footer">
-    <div>© HBA Emocional • Fase 1</div>
-    <div class="footer-hint">Uso científico / rehabilitación. No diagnóstico.</div>
+    <div>© HBA Emocional</div>
+    <div class="footer-hint">
+      Plataforma de investigación • Uso científico • No diagnóstico clínico
+    </div>
   </footer>
 
   <script src="/static/js/main.js"></script>
