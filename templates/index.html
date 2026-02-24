@@ -3,22 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>HBA Emocional - Plataforma Autonómica</title>
-
+  <title>HBA Emocional - Fase 1 (Datos)</title>
   <link rel="stylesheet" href="/static/css/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 
 <body>
-
   <header class="topbar">
     <div class="brand">
       <div class="brand-dot"></div>
       <div>
         <div class="brand-title">HBA Emocional</div>
-        <div class="brand-subtitle">
-          Plataforma de Monitoreo Autonómico • Rehabilitación
-        </div>
+        <div class="brand-subtitle">HRV • Polar H10 / Cámara • Fase 1</div>
       </div>
     </div>
 
@@ -29,9 +25,8 @@
   </header>
 
   <main class="container">
-
-    <section class="panel panel-config">
-      <h2>Configuración de Registro</h2>
+    <section class="panel">
+      <h2>Configuración</h2>
 
       <div class="grid-2">
         <div class="field">
@@ -55,43 +50,38 @@
           <select id="sensorType">
             <option value="camera_ppg">Cámara (PPG)</option>
             <option value="polar_h10">Polar H10 (BLE)</option>
-            <option value="garmin_hrm">Garmin Banda Pecho (BLE)</option>
           </select>
-          <div class="hint">
-            BLE requiere Chrome/Edge y HTTPS o localhost. Garmin: si no entrega RR, no se calcula HRV.
-          </div>
+          <div class="hint">Polar H10 requiere Chrome/Edge y HTTPS o localhost.</div>
         </div>
 
         <div class="field">
           <label>Duración</label>
           <div class="segmented">
-            <button class="seg-btn active" id="dur3">3 minutos</button>
-            <button class="seg-btn" id="dur5">5 minutos</button>
+            <button class="seg-btn active" data-min="3" id="dur3">3 min</button>
+            <button class="seg-btn" data-min="5" id="dur5">5 min</button>
           </div>
-          <div class="hint">
-            5 min recomendado para análisis espectral más estable.
-          </div>
+          <div class="hint">5 min recomendado para LF/HF más estable.</div>
         </div>
       </div>
 
       <div class="actions">
-        <button class="btn primary" id="btnStart">Iniciar Medición</button>
+        <button class="btn primary" id="btnStart">Iniciar</button>
         <button class="btn" id="btnStop" disabled>Detener</button>
-        <button class="btn success" id="btnSave" disabled>Guardar Resultado</button>
+        <button class="btn success" id="btnSave" disabled>Guardar</button>
       </div>
 
       <div class="note">
         <label>Notas (opcional)</label>
-        <input id="notes" type="text" placeholder="Ej: descanso previo, medicación, observaciones..." />
+        <input id="notes" type="text" placeholder="Ej: descanso previo, medicación, etc." />
       </div>
     </section>
 
-    <section class="panel panel-signal">
+    <section class="panel">
       <div class="panel-head">
-        <h2>Señal en Tiempo Real</h2>
+        <h2>Señal</h2>
         <div class="mini">
           <span class="chip" id="chipSensor">Sensor: Cámara (PPG)</span>
-          <span class="chip accent" id="chipTimer">00:00</span>
+          <span class="chip" id="chipTimer">00:00</span>
         </div>
       </div>
 
@@ -103,23 +93,27 @@
       <canvas id="frameCanvas" class="hidden"></canvas>
     </section>
 
-    <section class="panel panel-results">
+    <section class="panel">
       <div class="panel-head">
-        <h2>Resultados Fisiológicos</h2>
+        <h2>Resultados</h2>
         <div class="hint" id="freqHint"></div>
       </div>
 
-      <div class="section-title">Estado Autonómico</div>
-      <div class="cards vitals" id="cards"></div>
-    </section>
+      <div class="cards" id="cards"></div>
 
+      <div class="panel-head" style="margin-top:14px;">
+        <h2>Evolución Alumno</h2>
+        <div class="hint" id="historyHint"></div>
+      </div>
+      <div class="chart-wrap" style="height:220px;">
+        <canvas id="historyChart"></canvas>
+      </div>
+    </section>
   </main>
 
   <footer class="footer">
     <div>© HBA Emocional</div>
-    <div class="footer-hint">
-      Plataforma de investigación • Uso científico • No diagnóstico clínico
-    </div>
+    <div class="footer-hint">Uso científico / rehabilitación. No diagnóstico.</div>
   </footer>
 
   <script src="/static/js/main.js"></script>
