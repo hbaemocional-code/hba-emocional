@@ -14,10 +14,11 @@
     <div class="brand">
       <div class="brand-logo">
         <img src="/static/img/hba_logo.png" alt="HBA" onerror="this.style.display='none';" />
+        <div class="brand-fallback" aria-hidden="true">HBA</div>
       </div>
       <div>
         <div class="brand-title">HBA Emocional</div>
-        <div class="brand-subtitle">Recolección de HRV • Fase 1 (Datos)</div>
+        <div class="brand-subtitle">HRV • Rehabilitación • Captura Científica</div>
       </div>
     </div>
 
@@ -28,8 +29,14 @@
   </header>
 
   <main class="container">
-    <section class="panel">
-      <h2>Configuración de Registro</h2>
+    <section class="panel panel-left">
+      <div class="panel-title-row">
+        <h2>Registro</h2>
+        <div class="micro-badges">
+          <span class="badge">Modo Clínica</span>
+          <span class="badge badge-red">Élite</span>
+        </div>
+      </div>
 
       <div class="grid-2">
         <div class="field">
@@ -47,61 +54,214 @@
         <input id="comorbidities" type="text" placeholder="Ej: HTA, DM2, EPOC" />
       </div>
 
-      <div class="grid-2">
-        <div class="field">
-          <label>Sensor</label>
-          <select id="sensorType">
-            <option value="camera_ppg">Cámara (PPG)</option>
-            <option value="polar_h10">Polar H10 (BLE)</option>
-          </select>
-          <div class="hint">Polar H10 requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost.</div>
+      <!-- Selector moderno (NO cambia IDs ni rutas). Mantiene #sensorType -->
+      <div class="field">
+        <label>Fuente de señal</label>
+
+        <div class="sensor-toggle" role="tablist" aria-label="Selector de sensor">
+          <button class="sensor-pill active" type="button" data-value="camera_ppg">
+            <span class="dot red"></span>
+            Cámara PPG
+          </button>
+          <button class="sensor-pill" type="button" data-value="polar_h10">
+            <span class="dot cyan"></span>
+            Polar Bluetooth
+          </button>
+          <button class="sensor-pill" type="button" data-value="ant_group">
+            <span class="dot violet"></span>
+            ANT+ Grupo
+            <span class="pill-tag">Bridge</span>
+          </button>
         </div>
 
+        <!-- select original (ID intacta). Se mantiene por compatibilidad JS -->
+        <select id="sensorType" class="sr-only">
+          <option value="camera_ppg">Cámara (PPG)</option>
+          <option value="polar_h10">Polar H10 (BLE)</option>
+          <option value="ant_group">ANT+ Grupo</option>
+        </select>
+
+        <div class="hint">
+          Polar requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost. ANT+ Grupo usa bridge (no realtime).
+        </div>
+      </div>
+
+      <div class="grid-2">
         <div class="field">
           <label>Duración</label>
           <div class="segmented">
-            <button class="seg-btn active" data-min="3" id="dur3">3 minutos</button>
-            <button class="seg-btn" data-min="5" id="dur5">5 minutos</button>
+            <button class="seg-btn active" data-min="3" id="dur3">3 min</button>
+            <button class="seg-btn" data-min="5" id="dur5">5 min</button>
           </div>
-          <div class="hint" id="freqHint">5 min recomendado para espectral (LF/HF) más estable.</div>
+          <div class="hint">5 min recomendado para espectral (LF/HF) más estable.</div>
+        </div>
+
+        <div class="field">
+          <label>Calidad de señal</label>
+
+          <!-- REEMPLAZA el chip por una barra, pero mantiene el ID chipQuality -->
+          <div id="chipQuality" class="quality-bar" aria-label="Calidad de señal">
+            <div class="quality-track">
+              <div class="quality-fill" style="width:0%"></div>
+              <div class="quality-sheen"></div>
+            </div>
+            <div class="quality-meta">
+              <span class="quality-label">Calidad</span>
+              <span class="quality-value" id="qualityValue">—</span>
+            </div>
+          </div>
+
+          <div class="hint" id="qualityHint">Mantener dedo firme, sin presión excesiva y sin movimiento.</div>
         </div>
       </div>
 
       <div class="actions">
-        <button class="btn primary" id="btnStart">Iniciar Medición</button>
-        <button class="btn" id="btnStop" disabled>Detener</button>
-        <button class="btn success" id="btnSave" disabled>Guardar Resultado</button>
+        <button class="btn btn-red btn-xl" id="btnStart">Iniciar Medición</button>
+        <button class="btn btn-dark btn-xl" id="btnStop" disabled>Detener</button>
+        <button class="btn btn-green btn-xl" id="btnSave" disabled>Guardar Resultado</button>
       </div>
 
       <div class="note">
         <label>Notas (opcional)</label>
-        <input id="notes" type="text" placeholder="Ej: descanso 2 min previo, medicación, etc." />
+        <input id="notes" type="text" placeholder="Ej: descanso previo, medicación, etc." />
+      </div>
+
+      <!-- Dashboard Multi-Usuario (oculto por defecto) -->
+      <div id="multiUserContainer" class="multi-user hidden">
+        <div class="panel-head tight">
+          <h2>Multi-Usuario</h2>
+          <div class="hint">Hasta 10 alumnos • Vista rápida</div>
+        </div>
+
+        <div class="multi-grid">
+          <!-- Tarjetas de ejemplo (podés duplicar hasta 10). No requiere JS ahora. -->
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 1</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 2</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 3</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 4</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 5</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 6</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 7</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 8</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 9</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+
+          <div class="mu-card">
+            <div class="mu-top">
+              <div class="mu-name">Alumno 10</div>
+              <div class="mu-score">HRV <span class="mu-score-val">—</span></div>
+            </div>
+            <div class="mu-mini">
+              <div class="mu-pulse"></div>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel panel-right">
       <div class="panel-head">
-        <h2>Señal en Tiempo Real</h2>
+        <h2>Monitor</h2>
         <div class="mini">
           <span class="chip" id="chipSensor">Sensor: Cámara (PPG)</span>
           <span class="chip chip-strong" id="chipTimer">00:00</span>
-          <span class="chip chip-quality" id="chipQuality">Calidad: —</span>
         </div>
       </div>
 
       <div class="chart-wrap ecg">
+        <div class="monitor-frame"></div>
+        <div class="monitor-scan"></div>
         <canvas id="signalChart"></canvas>
+        <div class="monitor-label">LIVE</div>
       </div>
 
       <video id="video" playsinline autoplay muted class="hidden"></video>
       <canvas id="frameCanvas" class="hidden"></canvas>
 
-      <div class="hint" id="qualityHint">Indicador de calidad en vivo para evitar fallos al final.</div>
-    </section>
+      <div class="divider"></div>
 
-    <section class="panel">
       <div class="panel-head">
         <h2>Data Details</h2>
+        <div class="hint" id="freqHint"></div>
       </div>
 
       <div class="cards" id="cards"></div>
