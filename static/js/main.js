@@ -1,7 +1,13 @@
 /* static/js/main.js  (REEMPLAZAR COMPLETO)
-   - Mantiene: /api/compute y /api/save; Polar BLE.
-   - FIX: Torch toggle manda (OFF = nunca se auto-prende).
-   - PPG: ROI 50x50 canal ROJO, rAF 30fps, detrend+bandpass+winsorize+zscore.
+   Mantiene:
+   - /api/compute y /api/save
+   - Polar BLE
+   Arregla:
+   - PPG: ROI 50x50 centro canal ROJO
+   - 30fps estable (rAF + scheduler)
+   - NO descartar frames: suavizar/limpiar siempre
+   - Sanitizar contra NaN/Inf/outliers antes de enviar a backend
+   - Torch: OFF manda (no auto-ON), AUTO solo si el usuario lo permite
 */
 
 let selectedDurationMin = 3;
@@ -168,6 +174,7 @@ function setupDurationButtons(){
   const b3 = document.getElementById("dur3");
   const b5 = document.getElementById("dur5");
   if(!b3 || !b5) return;
+
   function setActive(min){
     selectedDurationMin = min;
     b3.classList.toggle("active", min === 3);
@@ -208,7 +215,7 @@ function buildCards(metrics){
   if(metrics.error){
     const c = document.createElement("div");
     c.className = "card bad";
-    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / dedo / luz</div>`;
+    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">PPG OK en pantalla pero backend falló</div>`;
     cards.appendChild(c);
     return;
   }
@@ -268,7 +275,6 @@ function torchCapable(track){
   }
 }
 
-// throttle applyConstraints
 let torchApplyInFlight = false;
 let lastTorchApplyAt = 0;
 
@@ -308,24 +314,65 @@ function meanRedROI(img){
   return sum / (img.length / 4);
 }
 
-/* ========================= Preprocess ========================= */
+/* ========================= Robust preprocesado ========================= */
+function replaceNonFinite(x){
+  // reemplaza NaN/Inf con último valor válido (o 0)
+  const y = new Array(x.length);
+  let last = 0;
+  for(let i=0;i<x.length;i++){
+    const v = x[i];
+    if(Number.isFinite(v)){
+      last = v;
+      y[i] = v;
+    } else {
+      y[i] = last;
+    }
+  }
+  return y;
+}
+
+function clampByMAD(x, k=8.0){
+  // clamp outliers usando MAD (robusto)
+  const n = x.length;
+  if(n < 20) return x.slice();
+
+  const sorted = x.slice().sort((a,b)=>a-b);
+  const median = sorted[Math.floor(n/2)];
+  const absDev = x.map(v => Math.abs(v - median)).sort((a,b)=>a-b);
+  const mad = absDev[Math.floor(n/2)] || 1e-6;
+
+  const lo = median - k*mad;
+  const hi = median + k*mad;
+
+  return x.map(v => Math.min(hi, Math.max(lo, v)));
+}
+
+function movingAverage(x, w){
+  const n = x.length;
+  if(n === 0) return [];
+  const ww = Math.max(3, w|0);
+  const half = Math.floor(ww/2);
+
+  const pref = new Array(n+1);
+  pref[0]=0;
+  for(let i=0;i<n;i++) pref[i+1]=pref[i]+x[i];
+
+  const y = new Array(n);
+  for(let i=0;i<n;i++){
+    const a = Math.max(0, i-half);
+    const b = Math.min(n-1, i+half);
+    y[i]=(pref[b+1]-pref[a])/(b-a+1);
+  }
+  return y;
+}
+
 function detrendMovingAverage(x, fs, winSec = 1.5){
   const n = x.length;
   if(n < 20) return x.slice();
   const w = Math.max(5, Math.floor(fs * winSec));
-  const half = Math.floor(w / 2);
-
-  const pref = new Array(n + 1);
-  pref[0] = 0;
-  for(let i=0;i<n;i++) pref[i+1] = pref[i] + x[i];
-
+  const trend = movingAverage(x, w);
   const y = new Array(n);
-  for(let i=0;i<n;i++){
-    const a = Math.max(0, i - half);
-    const b = Math.min(n - 1, i + half);
-    const mean = (pref[b+1] - pref[a]) / (b - a + 1);
-    y[i] = x[i] - mean;
-  }
+  for(let i=0;i<n;i++) y[i]=x[i]-trend[i];
   return y;
 }
 
@@ -359,11 +406,9 @@ function winsorize(x, zLim = 4.5){
   let m = 0;
   for(const v of x) m += v;
   m /= n;
-
   let v2 = 0;
   for(const v of x) v2 += (v - m) * (v - m);
   const sd = Math.sqrt(v2 / n) || 1e-6;
-
   const lo = m - zLim * sd;
   const hi = m + zLim * sd;
   return x.map(v => Math.min(hi, Math.max(lo, v)));
@@ -424,24 +469,17 @@ async function startCameraPPG(){
 
   trackRef = mediaStream.getVideoTracks()[0];
 
-  // ROI 50x50
   const roiW = 50, roiH = 50;
   frameCanvas.width = roiW;
   frameCanvas.height = roiH;
 
-  // torch
   torchAvailable = torchCapable(trackRef);
   torchEnabled = false;
 
-  // leer modo desde UI y aplicar inmediatamente
   readTorchModeFromUI();
-
   if(torchAvailable){
-    if(torchMode === "auto"){
-      applyTorch(true);
-    } else {
-      applyTorch(false);
-    }
+    if(torchMode === "auto") applyTorch(true);
+    else applyTorch(false);
   } else {
     setTorchLabel("N/A");
   }
@@ -452,7 +490,7 @@ async function startCameraPPG(){
   let baseline = null;
   const alpha = 0.02;
 
-  // quality buffers
+  // calidad: p2p ventana
   const winN = Math.round(2.0 * targetFps);
   const buf = [];
   let lastMeanR = null;
@@ -498,7 +536,7 @@ async function startCameraPPG(){
       const tooDark = meanR <= DARK_LOW;
       const lightBad = dL >= LIGHT_JUMP;
 
-      // torch adaptativo SOLO si AUTO
+      // torch adaptativo SOLO si AUTO (si está OFF no toca)
       if(clipped){
         satStreak++;
         darkStreak = Math.max(0, darkStreak - 1);
@@ -513,24 +551,11 @@ async function startCameraPPG(){
       if(torchAvailable && torchMode === "auto"){
         if(satStreak >= 6){
           satStreak = 0;
-          if(torchEnabled){
-            applyTorch(false);
-            if(Date.now() - lastMsgAt > 900){
-              lastMsgAt = Date.now();
-              setStatus("Flash quema • apagando flash automático", "warn");
-            }
-          }
+          if(torchEnabled) applyTorch(false);
         }
-
         if(darkStreak >= 6){
           darkStreak = 0;
-          if(!torchEnabled){
-            applyTorch(true);
-            if(Date.now() - lastMsgAt > 900){
-              lastMsgAt = Date.now();
-              setStatus("Oscuro • encendiendo flash automático", "warn");
-            }
-          }
+          if(!torchEnabled) applyTorch(true);
         }
       }
 
@@ -541,19 +566,13 @@ async function startCameraPPG(){
       const ac = meanR - baseline;
       const norm = (baseline !== 0) ? (ac / baseline) : 0;
 
-      // frame usable
-      const okFrame = (!clipped && !tooDark && !lightBad);
-
+      // ✅ NO descartamos nunca: siempre guardamos el frame
       ppgTimestamps.push(performance.now());
-      if(okFrame){
-        ppgSamples.push(norm);
-      } else {
-        const prev = ppgSamples.length ? ppgSamples[ppgSamples.length - 1] : 0;
-        ppgSamples.push(prev);
-      }
+      ppgSamples.push(norm);
 
       pushChartPoint(ac * 60);
 
+      // calidad visual
       buf.push(norm);
       if(buf.length > winN) buf.shift();
 
@@ -563,19 +582,17 @@ async function startCameraPPG(){
         const p2p = mx - mn;
 
         let score = 0;
-        score += Math.min(70, (p2p / (AMP_LOW * 6)) * 70);
-        score += okFrame ? 30 : 10;
+        score += Math.min(100, (p2p / (AMP_LOW * 10)) * 100);
         score = Math.max(0, Math.min(100, score));
         setQuality(score);
 
-        if(Date.now() - lastMsgAt > 850){
+        if(Date.now() - lastMsgAt > 900){
           lastMsgAt = Date.now();
           if(clipped) setStatus("Flash quema • aflojá o apagá flash", "warn");
           else if(tooDark) setStatus(torchAvailable ? "Muy oscuro • cubrí lente+flash" : "Muy oscuro • sin flash puede fallar", "warn");
-          else if(lightBad) setStatus("Movimiento/luz • mantené el dedo quieto", "warn");
-          else if(p2p < AMP_LOW) setStatus("Amplitud baja • presioná un poco más firme (sin aplastar)", "warn");
-          else if(score >= 70) setStatus("Señal alta • excelente", "ok");
-          else setStatus("Señal media • mantené estable", "ok");
+          else if(lightBad) setStatus("Cambios bruscos de luz • mantené el dedo quieto", "warn");
+          else if(p2p < AMP_LOW) setStatus("Amplitud baja • presioná un poco más firme", "warn");
+          else setStatus("Señal alta • excelente", "ok");
         }
       }
     }
@@ -592,7 +609,6 @@ async function stopCameraPPG(){
     rafId = null;
   }
 
-  // si el usuario puso OFF, respetamos igual; igual apagamos al salir
   try{
     if(trackRef && torchAvailable){
       applyTorch(false);
@@ -759,10 +775,13 @@ async function stopMeasurement(){
       if(meanDt > 0) fs = 1.0 / meanDt;
     }
 
-    let cleaned = detrendMovingAverage(ppgSamples, fs, 1.5);
-    cleaned = iirHighPass(cleaned, fs, 0.7);
-    cleaned = iirLowPass(cleaned, fs, 4.0);
-    cleaned = winsorize(cleaned, 4.5);
+    // ✅ Sanitización fuerte (cero NaN/Inf, outliers controlados)
+    let cleaned = replaceNonFinite(ppgSamples);
+    cleaned = clampByMAD(cleaned, 10.0);
+    cleaned = detrendMovingAverage(cleaned, fs, 1.8);
+    cleaned = iirHighPass(cleaned, fs, 0.5);  // un toque más “flexible”
+    cleaned = iirLowPass(cleaned, fs, 4.5);
+    cleaned = winsorize(cleaned, 6.0);
     cleaned = zscore(cleaned);
 
     payload.ppg = cleaned;
@@ -853,21 +872,16 @@ window.addEventListener("DOMContentLoaded", () => {
   setTimerText();
   setStatus("Listo", "idle");
 
-  // Torch UI: manda en runtime
   const tt = document.getElementById("torchToggle");
   if(tt){
     readTorchModeFromUI();
     tt.addEventListener("change", () => {
       readTorchModeFromUI();
-      // si ya hay cámara activa, aplicar inmediatamente
       if(trackRef && torchAvailable){
         if(torchMode === "off") applyTorch(false);
         else applyTorch(true);
       }
     });
-  } else {
-    // si no existe UI, por defecto auto
-    torchMode = "auto";
   }
 
   document.getElementById("btnStart").addEventListener("click", async () => {
