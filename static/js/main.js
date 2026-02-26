@@ -2,12 +2,13 @@
    Mantiene:
    - /api/compute y /api/save
    - Polar BLE
-   Arregla:
-   - PPG: ROI 50x50 centro canal ROJO
+   Soluciona (SOLO PPG):
+   - Señal “AC-only” (separa DC/AC para que presión/exposición NO dominen)
    - 30fps estable (rAF + scheduler)
-   - NO descartar frames: suavizar/limpiar siempre
-   - Sanitizar contra NaN/Inf/outliers antes de enviar a backend
-   - Torch: OFF manda (no auto-ON), AUTO solo si el usuario lo permite
+   - ROI 50x50 centro canal ROJO
+   - Torch AUTO inteligente (evita saturación/quemado y calor)
+   - Calidad REAL (no solo amplitud): combina amplitud + estabilidad de periodo
+   - Envío al backend: sigue igual (sanitización ya existente)
 */
 
 let selectedDurationMin = 3;
@@ -215,7 +216,7 @@ function buildCards(metrics){
   if(metrics.error){
     const c = document.createElement("div");
     c.className = "card bad";
-    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">PPG OK en pantalla pero backend falló</div>`;
+    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / iluminación</div>`;
     cards.appendChild(c);
     return;
   }
@@ -316,7 +317,6 @@ function meanRedROI(img){
 
 /* ========================= Robust preprocesado ========================= */
 function replaceNonFinite(x){
-  // reemplaza NaN/Inf con último valor válido (o 0)
   const y = new Array(x.length);
   let last = 0;
   for(let i=0;i<x.length;i++){
@@ -332,7 +332,6 @@ function replaceNonFinite(x){
 }
 
 function clampByMAD(x, k=8.0){
-  // clamp outliers usando MAD (robusto)
   const n = x.length;
   if(n < 20) return x.slice();
 
@@ -426,7 +425,13 @@ function zscore(x){
   return x.map(v => (v - m) / sd);
 }
 
-/* ========================= Camera PPG ========================= */
+/* ==========================================================
+   Camera PPG (SOLUCIÓN PRO)
+   - AC-only real: separa DC/AC para que presión/exposición NO dominen
+   - Filtro en vivo simple: HP + LP (banda cardiaca)
+   - Torch AUTO: evita saturación y calor (apaga si quema, prende si oscuro)
+   - Calidad: amplitud + estabilidad de periodo (no “amplitud sola”)
+========================================================== */
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
   frameCanvas = document.getElementById("frameCanvas");
@@ -486,24 +491,37 @@ async function startCameraPPG(){
 
   setStatus("Cámara activa • recolectando PPG", "ok");
 
-  // baseline EWMA
+  // ---------- estados de filtro en vivo ----------
+  // DC baseline (lento)
   let baseline = null;
-  const alpha = 0.02;
+  const dcAlpha = 0.01; // más lento => menos sensibilidad a presión/exposición
 
-  // calidad: p2p ventana
-  const winN = Math.round(2.0 * targetFps);
+  // High-pass (diferencia + estado)
+  let hpState = 0;
+  let prevNorm = null;
+  const hpAlpha = 0.96;
+
+  // Low-pass (suavizado)
+  let lpState = 0;
+  const lpAlpha = 0.18;
+
+  // Calidad: buffers
+  const winN = Math.round(2.5 * targetFps);   // ventana de 2.5s
   const buf = [];
-  let lastMeanR = null;
+  const peakTimes = []; // picos aproximados para estabilidad (solo calidad)
   let lastMsgAt = 0;
 
-  const SAT_HIGH = 250;
-  const DARK_LOW = 18;
-  const LIGHT_JUMP = 10.0;
-  const AMP_LOW = 0.0010;
-
+  // Torch AUTO: thresholds (objetivo es evitar saturación/oscuro)
+  const SAT_HIGH = 242;
+  const DARK_LOW = 55;
   let satStreak = 0;
   let darkStreak = 0;
 
+  // Detección picos para calidad (NO para RR final)
+  let prev2 = 0, prev1 = 0, cur = 0;
+  let lastPeakAt = 0;
+
+  // Scheduler 30fps estable
   const framePeriod = 1000 / targetFps;
   let lastTick = performance.now();
   let acc = 0;
@@ -529,14 +547,10 @@ async function startCameraPPG(){
       const img = frameCtx.getImageData(0, 0, roiW, roiH).data;
       const meanR = meanRedROI(img);
 
-      const dL = (lastMeanR == null) ? 0 : Math.abs(meanR - lastMeanR);
-      lastMeanR = meanR;
-
+      // Torch AUTO inteligente (sin intensidad variable, solo ON/OFF)
       const clipped = meanR >= SAT_HIGH;
       const tooDark = meanR <= DARK_LOW;
-      const lightBad = dL >= LIGHT_JUMP;
 
-      // torch adaptativo SOLO si AUTO (si está OFF no toca)
       if(clipped){
         satStreak++;
         darkStreak = Math.max(0, darkStreak - 1);
@@ -549,50 +563,131 @@ async function startCameraPPG(){
       }
 
       if(torchAvailable && torchMode === "auto"){
-        if(satStreak >= 6){
+        // si “quema” sostenido, apagar para bajar calor y evitar saturación
+        if(satStreak >= 5){
           satStreak = 0;
           if(torchEnabled) applyTorch(false);
         }
-        if(darkStreak >= 6){
+        // si está oscuro sostenido, prender
+        if(darkStreak >= 5){
           darkStreak = 0;
           if(!torchEnabled) applyTorch(true);
         }
       }
 
-      // baseline / señal
+      // =========================
+      // SEÑAL PRO: AC-only real
+      // =========================
       if(baseline === null) baseline = meanR;
-      baseline = (1 - alpha) * baseline + alpha * meanR;
+      baseline = (1 - dcAlpha) * baseline + dcAlpha * meanR;
 
-      const ac = meanR - baseline;
-      const norm = (baseline !== 0) ? (ac / baseline) : 0;
+      // AC (microvariación) y normalización relativa (reduce presión)
+      let ac = meanR - baseline;
+      let norm = 0;
+      if(baseline > 12) norm = ac / baseline;
 
-      // ✅ NO descartamos nunca: siempre guardamos el frame
+      // High-pass (elimina deriva residual)
+      if(prevNorm === null) prevNorm = norm;
+      hpState = hpAlpha * (hpState + norm - prevNorm);
+      prevNorm = norm;
+
+      // Low-pass (quita dientes/serrucho)
+      lpState = lpState + lpAlpha * (hpState - lpState);
+
+      // Clamp suave para cortar spikes digitales de exposición
+      let clean = lpState;
+      if(clean > 0.06) clean = 0.06;
+      if(clean < -0.06) clean = -0.06;
+
+      // Guardar señal (la que va al backend)
       ppgTimestamps.push(performance.now());
-      ppgSamples.push(norm);
+      ppgSamples.push(clean);
 
-      pushChartPoint(ac * 60);
+      // Visual (más suave y proporcional)
+      pushChartPoint(clean * 220);
 
-      // calidad visual
-      buf.push(norm);
+      // =========================
+      // Calidad REAL (amplitud + estabilidad)
+      // =========================
+      buf.push(clean);
       if(buf.length > winN) buf.shift();
 
-      if(buf.length >= Math.round(1.2 * targetFps)){
+      // detección de pico simple para estabilidad (solo calidad):
+      // pico cuando hay máximo local y pasó un refractory mínimo
+      prev2 = prev1;
+      prev1 = cur;
+      cur = clean;
+
+      const tNow = performance.now();
+      const refractoryMs = 330; // ~180 bpm max
+      if(prev1 > prev2 && prev1 > cur && (tNow - lastPeakAt) > refractoryMs){
+        // umbral adaptativo simple: pico debe superar amplitud mínima local
+        // (no “estricto”: si hay señal baja, igual detecta pocos y la calidad baja)
         let mn = Infinity, mx = -Infinity;
         for(const v of buf){ if(v < mn) mn = v; if(v > mx) mx = v; }
         const p2p = mx - mn;
+        if(p2p > 0.004){ // umbral mínimo muy bajo
+          peakTimes.push(tNow);
+          lastPeakAt = tNow;
+          // mantener últimos 8–10 picos
+          while(peakTimes.length > 10) peakTimes.shift();
+        }
+      }
 
-        let score = 0;
-        score += Math.min(100, (p2p / (AMP_LOW * 10)) * 100);
-        score = Math.max(0, Math.min(100, score));
-        setQuality(score);
+      // calcular score cada ~350ms
+      if(buf.length >= Math.round(1.5 * targetFps)){
+        const nowMs = Date.now();
+        if(nowMs - lastMsgAt > 350){
+          lastMsgAt = nowMs;
 
-        if(Date.now() - lastMsgAt > 900){
-          lastMsgAt = Date.now();
-          if(clipped) setStatus("Flash quema • aflojá o apagá flash", "warn");
-          else if(tooDark) setStatus(torchAvailable ? "Muy oscuro • cubrí lente+flash" : "Muy oscuro • sin flash puede fallar", "warn");
-          else if(lightBad) setStatus("Cambios bruscos de luz • mantené el dedo quieto", "warn");
-          else if(p2p < AMP_LOW) setStatus("Amplitud baja • presioná un poco más firme", "warn");
-          else setStatus("Señal alta • excelente", "ok");
+          // amplitud
+          let mn = Infinity, mx = -Infinity;
+          for(const v of buf){ if(v < mn) mn = v; if(v > mx) mx = v; }
+          const p2p = mx - mn;
+
+          // estabilidad de periodo (si hay picos)
+          let stab = 0; // 0..1
+          if(peakTimes.length >= 5){
+            const rr = [];
+            for(let i=1;i<peakTimes.length;i++) rr.push(peakTimes[i]-peakTimes[i-1]);
+            const m = rr.reduce((a,b)=>a+b,0)/rr.length;
+            let v = 0;
+            for(const x of rr) v += (x-m)*(x-m);
+            const sd = Math.sqrt(v/rr.length);
+            // coef var bajo => estable
+            const cv = sd / (m + 1e-6);
+            // map: cv 0.05 => muy estable; cv 0.25 => pobre
+            stab = 1 - Math.min(1, Math.max(0, (cv - 0.05) / 0.20));
+          } else {
+            // sin suficientes picos => baja
+            stab = 0.15;
+          }
+
+          // amplitud score (p2p típico de clean es pequeño)
+          // map aproximado: 0.004..0.02
+          const ampScore = Math.max(0, Math.min(1, (p2p - 0.0035) / 0.0165));
+
+          // penalización por saturación/oscuro
+          let lightPenalty = 1.0;
+          if(clipped) lightPenalty *= 0.65;
+          if(tooDark) lightPenalty *= 0.75;
+
+          // score final
+          const score = 100 * lightPenalty * (0.55 * ampScore + 0.45 * stab);
+          setQuality(score);
+
+          // Mensajes (pocos, útiles)
+          if(clipped){
+            setStatus("Flash quema • AUTO bajará luz / aflojá presión", "warn");
+          } else if(tooDark){
+            setStatus(torchAvailable ? "Muy oscuro • AUTO prenderá flash" : "Muy oscuro • sin flash puede fallar", "warn");
+          } else if(p2p < 0.004){
+            setStatus("Señal baja • apoyá firme, sin apretar de más", "warn");
+          } else if(stab < 0.35){
+            setStatus("Señal inestable • dedo quieto y presión constante", "warn");
+          } else {
+            setStatus("Señal estable • excelente", "ok");
+          }
         }
       }
     }
@@ -611,6 +706,7 @@ async function stopCameraPPG(){
 
   try{
     if(trackRef && torchAvailable){
+      // siempre apagar al salir para no calentar
       applyTorch(false);
     }
   }catch(_e){}
@@ -775,11 +871,11 @@ async function stopMeasurement(){
       if(meanDt > 0) fs = 1.0 / meanDt;
     }
 
-    // ✅ Sanitización fuerte (cero NaN/Inf, outliers controlados)
+    // Sanitización fuerte (como ya lo tenías)
     let cleaned = replaceNonFinite(ppgSamples);
     cleaned = clampByMAD(cleaned, 10.0);
     cleaned = detrendMovingAverage(cleaned, fs, 1.8);
-    cleaned = iirHighPass(cleaned, fs, 0.5);  // un toque más “flexible”
+    cleaned = iirHighPass(cleaned, fs, 0.5);
     cleaned = iirLowPass(cleaned, fs, 4.5);
     cleaned = winsorize(cleaned, 6.0);
     cleaned = zscore(cleaned);
