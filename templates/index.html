@@ -128,6 +128,25 @@
               </div>
             </div>
 
+            <!-- ✅ NUEVO: Flash/Torch (no rompe nada si no existe torch) -->
+            <div class="formGrid" style="margin-top:10px;">
+              <div class="field">
+                <span class="fieldLabel">Flash (Torch)</span>
+                <label class="toggle">
+                  <input id="torchToggle" type="checkbox" checked />
+                  <span class="toggleTrack" aria-hidden="true"></span>
+                  <span id="torchLabel" class="toggleLabel">AUTO</span>
+                </label>
+              </div>
+
+              <div class="field">
+                <span class="fieldLabel">Tip</span>
+                <div class="tinyNote">
+                  Si el flash “quema” y aplana la onda, desactivá. Si está oscuro, activá.
+                </div>
+              </div>
+            </div>
+
             <div class="actionRow">
               <button id="btnStart" type="button" class="btn btnPrimary">
                 Iniciar
