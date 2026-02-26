@@ -1,4 +1,4 @@
-// static/js/main.js  (COMPLETO)
+// static/js/main.js  (COMPLETO)  — NO cambia IDs ni nombres de funciones existentes
 let selectedDurationMin = 3;
 let measuring = false;
 let sensorType = "camera_ppg";
@@ -37,8 +37,8 @@ const ecgGlowPlugin = {
   beforeDatasetsDraw(chartInstance, args, pluginOptions) {
     const { ctx } = chartInstance;
     ctx.save();
-    ctx.shadowColor = pluginOptions.shadowColor || "rgba(255, 43, 43, 0.55)";
-    ctx.shadowBlur = pluginOptions.shadowBlur || 12;
+    ctx.shadowColor = pluginOptions.shadowColor || "rgba(255, 43, 43, 0.70)";
+    ctx.shadowBlur = pluginOptions.shadowBlur || 18;
     ctx.shadowOffsetX = 0;
     ctx.shadowOffsetY = 0;
   },
@@ -85,42 +85,52 @@ function setTimerText(){
 
 function setSensorChip(){
   const chip = document.getElementById("chipSensor");
-  chip.textContent = sensorType === "polar_h10" ? "Sensor: Polar H10 (BLE)" : "Sensor: Cámara (PPG)";
+  chip.textContent =
+    sensorType === "polar_h10" ? "Sensor: Polar H10 (BLE)" :
+    sensorType === "ant_group" ? "Sensor: ANT+ Grupo (Bridge)" :
+    "Sensor: Cámara (PPG)";
 }
 
+/* ✅ Mantiene el nombre setQualityChip, pero ahora controla una barra */
 function setQualityChip(){
-  const chip = document.getElementById("chipQuality");
-  chip.textContent = `Calidad: ${qualityText}`;
+  const root = document.getElementById("chipQuality");
+  if(!root) return;
 
-  // color según nivel
-  if(qualityLevel === "ok"){
-    chip.style.borderColor = "rgba(52,211,153,0.35)";
-    chip.style.background = "rgba(52,211,153,0.10)";
-    chip.style.color = "var(--text)";
-  } else if(qualityLevel === "warn"){
-    chip.style.borderColor = "rgba(251,191,36,0.35)";
-    chip.style.background = "rgba(251,191,36,0.10)";
-    chip.style.color = "var(--text)";
-  } else if(qualityLevel === "bad"){
-    chip.style.borderColor = "rgba(251,113,133,0.35)";
-    chip.style.background = "rgba(251,113,133,0.10)";
-    chip.style.color = "var(--text)";
-  } else {
-    chip.style.borderColor = "rgba(255,255,255,0.10)";
-    chip.style.background = "rgba(11,18,32,0.55)";
-    chip.style.color = "var(--muted)";
+  const fill = root.querySelector(".quality-fill");
+  const valueEl = document.getElementById("qualityValue");
+
+  const clamped = Math.max(0, Math.min(100, Number(qualityScore) || 0));
+  if(fill) fill.style.width = `${clamped}%`;
+  if(valueEl) valueEl.textContent = `${Math.round(clamped)}%`;
+
+  // Texto/hint de calidad (sin cambiar IDs)
+  const hint = document.getElementById("qualityHint");
+  if(hint){
+    if(qualityLevel === "ok") hint.textContent = "Señal buena: mantené el dedo firme y sin movimiento.";
+    else if(qualityLevel === "warn") hint.textContent = "Señal moderada: ajustá presión y evitá movimiento.";
+    else if(qualityLevel === "bad") hint.textContent = "Señal mala: más estabilidad / mejor contacto / menos movimiento.";
+    else hint.textContent = "Mantener dedo firme, sin presión excesiva y sin movimiento.";
   }
 }
 
 function enableControls(){
-  document.getElementById("btnStart").disabled = measuring;
-  document.getElementById("btnStop").disabled = !measuring;
-  document.getElementById("btnSave").disabled = measuring || !lastMetrics || !!lastMetrics.error;
+  const startBtn = document.getElementById("btnStart");
+  const stopBtn = document.getElementById("btnStop");
+  const saveBtn = document.getElementById("btnSave");
+
+  const antSelected = (sensorType === "ant_group");
+  // ANT+ Grupo (bridge) no está implementado en este frontend
+  startBtn.disabled = measuring || antSelected;
+  stopBtn.disabled = !measuring;
+  saveBtn.disabled = measuring || !lastMetrics || !!lastMetrics.error;
+
+  if(antSelected){
+    setStatus("ANT+ Grupo requiere Bridge (no realtime en web).", "warn");
+  }
 }
 
 function initChart(){
   const ctx = document.getElementById("signalChart");
-
   chart = new Chart(ctx, {
     type: "line",
     data: {
@@ -129,7 +139,7 @@ function initChart(){
         label: "ECG",
         data: [],
         pointRadius: 0,
-        borderWidth: 2.2,
+        borderWidth: 2.6,
         tension: 0.25,
         borderColor: "#ff2b2b"
       }]
@@ -140,11 +150,14 @@ function initChart(){
       animation: false,
       plugins: {
         legend: { display: false },
-        ecgGlow: { shadowColor: "rgba(255, 43, 43, 0.55)", shadowBlur: 14 }
+        ecgGlow: { shadowColor: "rgba(255, 43, 43, 0.70)", shadowBlur: 18 }
       },
       scales: {
         x: { display: false },
         y: { display: false }
+      },
+      elements: {
+        line: { capBezierPoints: true }
       }
     },
     plugins: [ecgGlowPlugin]
@@ -152,7 +165,7 @@ function initChart(){
 }
 
 function pushChartPoint(value){
-  const maxPoints = 360;
+  const maxPoints = 420;
   chart.data.labels.push("");
   chart.data.datasets[0].data.push(value);
   if(chart.data.labels.length > maxPoints){
@@ -179,8 +192,26 @@ function setupSensorSelector(){
   sel.addEventListener("change", () => {
     sensorType = sel.value;
     setSensorChip();
-    setStatus("Listo", "idle");
+    enableControls();
   });
+
+  // UI moderno (pills) -> actualiza el select original
+  const pills = Array.from(document.querySelectorAll(".sensor-pill"));
+  pills.forEach(btn => {
+    btn.addEventListener("click", () => {
+      const v = btn.getAttribute("data-value");
+      if(!v) return;
+
+      pills.forEach(x => x.classList.toggle("active", x === btn));
+
+      sel.value = v;
+      sel.dispatchEvent(new Event("change"));
+    });
+  });
+
+  // Estado inicial sincronizado
+  const initial = sel.value || "camera_ppg";
+  pills.forEach(x => x.classList.toggle("active", x.getAttribute("data-value") === initial));
 }
 
 function buildCards(metrics){
@@ -197,12 +228,8 @@ function buildCards(metrics){
     return;
   }
 
-  if(metrics.freq_warning){
-    freqHint.textContent = metrics.freq_warning;
-  }
-  if(metrics.quality_warning){
-    freqHint.textContent = metrics.quality_warning;
-  }
+  if(metrics.freq_warning) freqHint.textContent = metrics.freq_warning;
+  if(metrics.quality_warning) freqHint.textContent = metrics.quality_warning;
 
   if(metrics.error){
     const c = document.createElement("div");
@@ -248,48 +275,36 @@ function buildCards(metrics){
 }
 
 // ----------------------------
-// Señal: “ECG-look” + Calidad en vivo
+// Señal: Calidad en vivo (mismo nombre de función)
 // ----------------------------
 function computeLiveQuality(recent){
-  // recent: array de valores normalizados (AC/DC)
   if(!recent || recent.length < 60) return {score: 0, text: "—", level: "idle"};
 
-  const x = recent.slice(-180);
+  const x = recent.slice(-220);
   const mean = x.reduce((a,b)=>a+b,0) / x.length;
   const v = x.reduce((a,b)=>a+(b-mean)*(b-mean),0) / x.length;
   const std = Math.sqrt(v);
 
-  // "movimiento": variación excesiva entre muestras
   let diffMean = 0;
   for(let i=1;i<x.length;i++) diffMean += Math.abs(x[i]-x[i-1]);
   diffMean /= (x.length-1);
 
-  // heurística simple:
-  // - std muy bajo => no hay pulso (malo)
-  // - diff muy alto => movimiento (malo)
-  // - zona media => ok
-  let score = 0;
+  const s1 = Math.min(std / 0.018, 1.0);
+  const m1 = Math.max(1.0 - (diffMean / 0.06), 0);
 
-  const s1 = Math.min(std / 0.02, 1.0);            // señal (0..1)
-  const m1 = Math.max(1.0 - (diffMean / 0.05), 0); // movimiento (0..1, más alto mejor)
-
-  score = Math.round((0.65*s1 + 0.35*m1) * 100);
+  const score = Math.round((0.65*s1 + 0.35*m1) * 100);
 
   let level = "warn";
-  let text = `${score}%`;
+  if(score >= 72) level="ok";
+  else if(score >= 45) level="warn";
+  else level="bad";
 
-  if(score >= 70){ level="ok"; }
-  else if(score >= 45){ level="warn"; }
-  else { level="bad"; }
-
-  return {score, text, level};
+  return {score, text:`${score}%`, level};
 }
 
-// “ECG look”: hacemos un realce simple (derivada + compresión) SOLO para display
 function toEcgDisplayValue(v){
-  // compresión suave
-  const y = Math.tanh(v * 8);
-  return y * 2.0;
+  // “ECG look”: compresión suave + realce
+  return Math.tanh(v * 10) * 2.2;
 }
 
 // ----------------------------
@@ -338,14 +353,13 @@ async function startCameraPPG(){
     }
   }catch(_e){}
 
+  setStatus(torchOn ? "Cámara + torch ON • PPG" : "Cámara activa • PPG", torchOn ? "ok" : "warn");
+
   const w = 160, h = 120;
   frameCanvas.width = w;
   frameCanvas.height = h;
 
-  setStatus(torchOn ? "Cámara + torch ON • PPG" : "Cámara activa • PPG", torchOn ? "ok" : "warn");
-
   const intervalMs = Math.round(1000 / targetFps);
-
   let runningMean = null;
 
   cameraLoopHandle = setInterval(() => {
@@ -364,18 +378,15 @@ async function startCameraPPG(){
     const ac = meanR - runningMean;
     const normalized = (runningMean !== 0) ? (ac / runningMean) : 0;
 
-    // guardar para backend
     ppgSamples.push(normalized);
     ppgTimestamps.push(performance.now());
 
-    // quality live
     const q = computeLiveQuality(ppgSamples);
     qualityScore = q.score;
     qualityText = q.text;
     qualityLevel = q.level;
     setQualityChip();
 
-    // display (ECG)
     pushChartPoint(toEcgDisplayValue(normalized));
   }, intervalMs);
 }
@@ -397,7 +408,7 @@ function stopCameraPPG(){
 }
 
 // ----------------------------
-// Polar H10 BLE (igual)
+// Polar H10 BLE
 // ----------------------------
 function parseHeartRateMeasurement(value){
   const flags = value.getUint8(0);
@@ -452,7 +463,7 @@ async function connectPolarH10(){
     if(rrs.length){
       rrs.forEach(rr => {
         rrIntervalsMs.push(rr);
-        pushChartPoint(rr / 1000.0); // display
+        pushChartPoint(rr / 1000.0);
       });
     }
   });
@@ -478,22 +489,29 @@ async function stopPolarH10(){
 }
 
 // ----------------------------
-// Medición start/stop/compute/save
+// Medición: start/stop/compute/save
 // ----------------------------
 async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
 
-  // Reset chart
+  // reset chart
   chart.data.labels = [];
   chart.data.datasets[0].data = [];
   chart.update("none");
 
   // reset quality
-  qualityScore = 0;
-  qualityText = "—";
-  qualityLevel = "idle";
+  qualityScore = 0; qualityText="—"; qualityLevel="idle";
   setQualityChip();
+
+  setSensorChip();
+  enableControls();
+
+  if(sensorType === "ant_group"){
+    // no rompe nada: solo bloquea inicio en web
+    setStatus("ANT+ Grupo requiere Bridge (no realtime en web).", "warn");
+    return;
+  }
 
   // conectar primero, luego iniciar medición
   if(sensorType === "polar_h10"){
@@ -509,7 +527,6 @@ async function startMeasurement(){
   measuring = true;
   startedAt = Date.now();
   enableControls();
-  setSensorChip();
 
   if(timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(async () => {
@@ -615,7 +632,7 @@ async function saveResult(){
     metrics: lastMetrics
   };
 
-  setStatus("Guardando en dataset_hba.csv…", "warn");
+  setStatus("Guardando…", "warn");
 
   try{
     const res = await fetch("/api/save", {
@@ -625,7 +642,7 @@ async function saveResult(){
     });
     const out = await res.json();
     if(out.ok){
-      setStatus("Guardado OK • dataset_hba.csv actualizado", "ok");
+      setStatus("Guardado OK", "ok");
     } else {
       setStatus("No se pudo guardar", "bad");
     }
