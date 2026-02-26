@@ -1,4 +1,12 @@
-/* static/js/main.js  (REEMPLAZAR COMPLETO) */
+/* static/js/main.js  (REEMPLAZAR COMPLETO)
+   - Mantiene: /api/compute y /api/save, nombres de funciones, y lógica Polar BLE
+   - Mejora cámara PPG:
+     ✅ usa CANAL ROJO
+     ✅ 30fps estables (requestVideoFrameCallback si existe, fallback timer)
+     ✅ baja CPU: ROI central + canvas chico + batch update del chart
+     ✅ indicador de calidad en tiempo real (barra rojo→verde)
+     ✅ envía crudo (normalizado) al backend, Python hace el trabajo pesado
+*/
 
 let selectedDurationMin = 3;
 let measuring = false;
@@ -16,9 +24,11 @@ let frameCtx = null;
 let ppgSamples = [];
 let ppgTimestamps = [];
 
-// CPU/Temperatura (no torch, menos resolución y fps moderado)
-let targetFps = 28;
-let cameraLoopHandle = null;
+// CPU/Temperatura (no torch, menos resolución, ROI, batch chart)
+let targetFps = 30;
+let cameraLoopHandle = null;          // setInterval id (fallback)
+let cameraRafActive = false;          // requestVideoFrameCallback loop flag
+let lastFrameProcessMs = 0;
 
 // Polar H10 BLE
 let bleDevice = null;
@@ -29,9 +39,14 @@ let lastMetrics = null;
 // Chart.js
 let chart = null;
 
+/* =========================
+   UI helpers
+========================= */
 function setStatus(text, level="idle"){
   const dot = document.getElementById("statusDot");
   const label = document.getElementById("statusText");
+  if(!dot || !label) return;
+
   label.textContent = text;
 
   if(level === "ok"){
@@ -57,6 +72,8 @@ function fmtTime(sec){
 
 function setTimerText(){
   const chipTimer = document.getElementById("chipTimer");
+  if(!chipTimer) return;
+
   if(!measuring || !startedAt){
     chipTimer.textContent = "00:00";
     return;
@@ -67,17 +84,22 @@ function setTimerText(){
 
 function setSensorChip(){
   const chip = document.getElementById("chipSensor");
+  if(!chip) return;
   chip.textContent = sensorType === "polar_h10" ? "Sensor: Polar H10 (BLE)" : "Sensor: Cámara (PPG)";
 }
 
 function enableControls(){
-  document.getElementById("btnStart").disabled = measuring;
-  document.getElementById("btnStop").disabled = !measuring;
-  document.getElementById("btnSave").disabled = measuring || !lastMetrics || !!lastMetrics.error;
+  const s = document.getElementById("btnStart");
+  const t = document.getElementById("btnStop");
+  const v = document.getElementById("btnSave");
+
+  if(s) s.disabled = measuring;
+  if(t) t.disabled = !measuring;
+  if(v) v.disabled = measuring || !lastMetrics || !!lastMetrics.error;
 }
 
 /* =========================
-   Calidad (solo informa)
+   Calidad (barra rojo→verde)
 ========================= */
 function setQuality(score){
   const fill = document.getElementById("qualityFill");
@@ -91,6 +113,7 @@ function setQuality(score){
   }
   const s = Math.max(0, Math.min(100, score));
   fill.style.width = `${s.toFixed(0)}%`;
+
   if(s >= 70) txt.textContent = "Alta";
   else if(s >= 40) txt.textContent = "Media";
   else txt.textContent = "Baja";
@@ -98,6 +121,7 @@ function setQuality(score){
 
 /* =========================
    Chart ECG rojo (estético)
+   - Batch update para bajar CPU
 ========================= */
 const glowPlugin = {
   id: "ecgGlow",
@@ -115,8 +139,8 @@ const glowPlugin = {
 };
 
 function initChart(){
-  const ctx = document.getElementById("signalChart");
-  chart = new Chart(ctx, {
+  const el = document.getElementById("signalChart");
+  chart = new Chart(el, {
     type: "line",
     data: {
       labels: [],
@@ -140,20 +164,49 @@ function initChart(){
   });
 }
 
-function pushChartPoint(value){
+// buffer de puntos para reducir chart.update (CPU)
+const chartQueue = [];
+let chartFlushHandle = null;
+
+function flushChart(){
+  if(!chart) return;
   const maxPoints = 320;
-  chart.data.labels.push("");
-  chart.data.datasets[0].data.push(value);
-  if(chart.data.labels.length > maxPoints){
-    chart.data.labels.shift();
-    chart.data.datasets[0].data.shift();
+
+  // meter varios puntos por flush
+  while(chartQueue.length){
+    const v = chartQueue.shift();
+    chart.data.labels.push("");
+    chart.data.datasets[0].data.push(v);
   }
+
+  // recortar
+  const over = chart.data.labels.length - maxPoints;
+  if(over > 0){
+    chart.data.labels.splice(0, over);
+    chart.data.datasets[0].data.splice(0, over);
+  }
+
   chart.update("none");
+}
+
+// MISMA firma usada por tu lógica (no se rompe)
+function pushChartPoint(value){
+  chartQueue.push(value);
+
+  // flush a ~15Hz para no saturar (suficiente para estética ECG)
+  if(!chartFlushHandle){
+    chartFlushHandle = setTimeout(() => {
+      chartFlushHandle = null;
+      flushChart();
+    }, 66);
+  }
 }
 
 function setupDurationButtons(){
   const b3 = document.getElementById("dur3");
   const b5 = document.getElementById("dur5");
+  if(!b3 || !b5) return;
+
   function setActive(min){
     selectedDurationMin = min;
     b3.classList.toggle("active", min === 3);
@@ -165,6 +218,8 @@ function setupDurationButtons(){
 
 function setupSensorSelector(){
   const sel = document.getElementById("sensorType");
+  if(!sel) return;
+
   sel.addEventListener("change", () => {
     sensorType = sel.value;
     setSensorChip();
@@ -175,6 +230,8 @@ function setupSensorSelector(){
 function buildCards(metrics){
   const cards = document.getElementById("cards");
   const freqHint = document.getElementById("freqHint");
+  if(!cards || !freqHint) return;
+
   cards.innerHTML = "";
   freqHint.textContent = "";
 
@@ -238,9 +295,6 @@ function buildCards(metrics){
 
 /* ==========================================================
    CÁMARA: BLOQUEO AUTOFOCUS + AUTOEXPOSURE (best-effort)
-   - Si el dispositivo lo soporta: pone foco MANUAL cerca
-   - Bloquea exposición/whitebalance para evitar “bombeo”
-   - Si NO lo soporta: no rompe, sigue igual
 ========================================================== */
 async function applyCameraLocks(track){
   if(!track) return;
@@ -250,30 +304,26 @@ async function applyCameraLocks(track){
 
   const adv = [];
 
-  // 1) Foco
-  // Preferimos: manual y foco cerca (finger on lens).
+  // Foco: manual cerca si existe
   if(caps && caps.focusMode){
     const modes = Array.isArray(caps.focusMode) ? caps.focusMode : [];
     if(modes.includes("manual")){
       adv.push({ focusMode: "manual" });
       if(caps.focusDistance){
         const min = caps.focusDistance.min ?? 0;
-        // cerca = mínimo
         adv.push({ focusDistance: min });
       }
     } else if(modes.includes("continuous")){
-      // fallback
       adv.push({ focusMode: "continuous" });
     }
   }
 
-  // 2) Exposición
+  // Exposición: manual con valores actuales (bloqueo estable)
   if(caps && caps.exposureMode){
     const modes = Array.isArray(caps.exposureMode) ? caps.exposureMode : [];
     if(modes.includes("manual")){
       adv.push({ exposureMode: "manual" });
 
-      // copiar valores actuales si existen (bloqueo estable)
       if(settings && typeof settings.exposureTime === "number" && caps.exposureTime){
         const v = Math.min(caps.exposureTime.max, Math.max(caps.exposureTime.min, settings.exposureTime));
         adv.push({ exposureTime: v });
@@ -287,14 +337,13 @@ async function applyCameraLocks(track){
     }
   }
 
-  // 3) Compensación exposición (si hay) — dejamos en el valor actual o 0
   if(caps && caps.exposureCompensation){
     const cur = (settings && typeof settings.exposureCompensation === "number") ? settings.exposureCompensation : 0;
     const v = Math.min(caps.exposureCompensation.max, Math.max(caps.exposureCompensation.min, cur));
     adv.push({ exposureCompensation: v });
   }
 
-  // 4) White balance (bloquea bombeo de color)
+  // White balance: manual si existe
   if(caps && caps.whiteBalanceMode){
     const modes = Array.isArray(caps.whiteBalanceMode) ? caps.whiteBalanceMode : [];
     if(modes.includes("manual")){
@@ -306,35 +355,48 @@ async function applyCameraLocks(track){
     }
   }
 
-  // aplicar si hay algo
   if(adv.length){
     try{
       await track.applyConstraints({ advanced: adv });
     }catch(_e){
-      // NO romper
+      // no romper
     }
   }
 }
 
 /* ==========================
    Cámara PPG (robusta + fría)
-   - usa canal VERDE
-   - NO torch (evita calor)
-   - locks autofocus/exposure cuando se puede
+   - ✅ usa canal ROJO
+   - ✅ 30fps estables
+   - ✅ ROI central para bajar CPU
+   - ✅ no torch
 ========================== */
+function computeMeanRedFromImageData(imgData){
+  // imgData = Uint8ClampedArray RGBA
+  let sumR = 0;
+  // step 4
+  for(let i=0; i<imgData.length; i+=4){
+    sumR += imgData[i]; // R
+  }
+  return sumR / (imgData.length / 4);
+}
+
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
   frameCanvas = document.getElementById("frameCanvas");
+  if(!videoEl || !frameCanvas) throw new Error("Faltan elementos de cámara en el DOM (video/frameCanvas).");
+
   frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
 
   ppgSamples = [];
   ppgTimestamps = [];
   setQuality(null);
 
+  // constraints pensadas para “frío”: resolución moderada y 30fps ideal
   mediaStream = await navigator.mediaDevices.getUserMedia({
     video: {
-      facingMode: "environment",
-      frameRate: { ideal: 30, min: 15 },
+      facingMode: { ideal: "environment" },
+      frameRate: { ideal: 30, min: 24, max: 30 },
       width: { ideal: 640 },
       height: { ideal: 480 }
     },
@@ -344,8 +406,10 @@ async function startCameraPPG(){
   videoEl.srcObject = mediaStream;
   videoEl.playsInline = true;
   videoEl.muted = true;
+
   try { await videoEl.play(); } catch(_e) {}
 
+  // esperar metadata de video
   const t0 = Date.now();
   while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
     await new Promise(r => setTimeout(r, 50));
@@ -356,61 +420,83 @@ async function startCameraPPG(){
 
   const track = mediaStream.getVideoTracks()[0];
 
-  // ✅ Lock AF/AE/WB (si el teléfono lo soporta)
+  // locks (best-effort)
   await applyCameraLocks(track);
 
-  // Canvas chico para bajar calor
-  const w = 96, h = 72;
-  frameCanvas.width = w;
-  frameCanvas.height = h;
+  // Canvas chico: ROI central (no toda la imagen)
+  // ROI pequeño = menos CPU + menos calor, suficiente para PPG
+  const roiW = 96, roiH = 96;
+  frameCanvas.width = roiW;
+  frameCanvas.height = roiH;
 
-  setStatus("Cámara activa • recolectando PPG", "ok");
+  setStatus("Cámara activa • recolectando PPG (ROJO)", "ok");
 
-  const intervalMs = Math.round(1000 / targetFps);
-
+  // filtros online para estabilizar señal y extraer AC
   let runningMean = null;
+  const alpha = 0.02; // smoothing (baja: más estable)
 
+  // calidad: buffer y cálculo robusto (relación energía señal vs “nervio”)
   const qbuf = [];
   const qmax = Math.round(5 * targetFps);
   let lastQualityTick = 0;
   let lowStreak = 0;
 
-  cameraLoopHandle = setInterval(() => {
+  // control FPS real
+  const minProcessInterval = 1000 / targetFps;
+  lastFrameProcessMs = 0;
+
+  const processFrame = (nowMs) => {
     if(!measuring) return;
 
-    frameCtx.drawImage(videoEl, 0, 0, w, h);
-    const img = frameCtx.getImageData(0, 0, w, h).data;
+    // throttling para 30fps reales (si llega más rápido, saltea)
+    if(lastFrameProcessMs && (nowMs - lastFrameProcessMs) < (minProcessInterval * 0.85)){
+      return;
+    }
+    lastFrameProcessMs = nowMs;
 
-    // Canal VERDE
-    let sumG = 0;
-    for(let i=0; i<img.length; i+=4) sumG += img[i+1];
-    const meanG = sumG / (img.length / 4);
+    // ROI: recortar centro del video y escalar al canvas chico
+    const vw = videoEl.videoWidth;
+    const vh = videoEl.videoHeight;
 
-    if (runningMean === null) runningMean = meanG;
-    runningMean = 0.98 * runningMean + 0.02 * meanG;
+    // centro
+    const cropSize = Math.min(vw, vh) * 0.35; // ~35% del lado menor
+    const sx = (vw - cropSize) / 2;
+    const sy = (vh - cropSize) / 2;
 
-    const ac = meanG - runningMean;
+    frameCtx.drawImage(videoEl, sx, sy, cropSize, cropSize, 0, 0, roiW, roiH);
+    const img = frameCtx.getImageData(0, 0, roiW, roiH).data;
+
+    // ✅ CANAL ROJO
+    const meanR = computeMeanRedFromImageData(img);
+
+    if(runningMean === null) runningMean = meanR;
+    runningMean = (1 - alpha) * runningMean + alpha * meanR;
+
+    const ac = meanR - runningMean;
     const normalized = (runningMean !== 0) ? (ac / runningMean) : 0;
 
-    // Visual ECG (solo estética)
-    pushChartPoint(ac * 40);
+    // estética ECG (decente con batch update)
+    pushChartPoint(ac * 45);
 
+    // guardar crudo (normalizado) para backend
     ppgSamples.push(normalized);
     ppgTimestamps.push(performance.now());
 
-    // Calidad (no punitivo)
+    // buffer de calidad
     qbuf.push(normalized);
     if(qbuf.length > qmax) qbuf.shift();
 
     const now = Date.now();
-    if(qbuf.length > Math.round(2 * targetFps) && (now - lastQualityTick) > 350){
+    if(qbuf.length > Math.round(2 * targetFps) && (now - lastQualityTick) > 300){
       lastQualityTick = now;
 
+      // std señal
       const m = qbuf.reduce((a,b)=>a+b,0) / qbuf.length;
       let varx = 0;
       for(const v of qbuf) varx += (v - m) * (v - m);
       const stdx = Math.sqrt(varx / qbuf.length);
 
+      // “nervio” = derivada (movimiento/ruido)
       let vard = 0;
       for(let i=1;i<qbuf.length;i++){
         const d = qbuf[i] - qbuf[i-1];
@@ -418,8 +504,9 @@ async function startCameraPPG(){
       }
       const stdd = Math.sqrt(vard / Math.max(1, qbuf.length-1));
 
+      // score: más alto si hay amplitud estable y poca derivada
       const raw = stdx / (stdd + 1e-6);
-      const score = Math.max(0, Math.min(100, raw * 55));
+      const score = Math.max(0, Math.min(100, raw * 58));
       setQuality(score);
 
       if(score < 25){
@@ -433,26 +520,54 @@ async function startCameraPPG(){
         setStatus("Señal alta • excelente", "ok");
       }
     }
+  };
 
-  }, intervalMs);
+  // Preferido: requestVideoFrameCallback (más estable y eficiente)
+  if(typeof videoEl.requestVideoFrameCallback === "function"){
+    cameraRafActive = true;
+
+    const loop = (_now, _meta) => {
+      if(!cameraRafActive) return;
+      if(measuring) {
+        // _now puede venir en high-res; igual usamos performance.now()
+        processFrame(performance.now());
+      }
+      videoEl.requestVideoFrameCallback(loop);
+    };
+
+    videoEl.requestVideoFrameCallback(loop);
+  } else {
+    // Fallback: timer
+    const intervalMs = Math.round(1000 / targetFps);
+    cameraLoopHandle = setInterval(() => {
+      if(!measuring) return;
+      processFrame(performance.now());
+    }, intervalMs);
+  }
 }
 
 function stopCameraPPG(){
+  // detener loops
+  cameraRafActive = false;
+
   if(cameraLoopHandle){
     clearInterval(cameraLoopHandle);
     cameraLoopHandle = null;
   }
+
+  // detener stream
   if(mediaStream){
     mediaStream.getTracks().forEach(t => t.stop());
     mediaStream = null;
   }
+
   setQuality(null);
   setStatus("Cámara detenida", "idle");
 }
 
-// ----------------------------
-// Polar H10 BLE
-// ----------------------------
+/* ----------------------------
+   Polar H10 BLE (mantener)
+---------------------------- */
 function parseHeartRateMeasurement(value){
   const flags = value.getUint8(0);
   const hrValue16 = (flags & 0x01) !== 0;
@@ -531,9 +646,10 @@ async function stopPolarH10(){
   setStatus("Polar detenido", "idle");
 }
 
-// ----------------------------
-// Medición: start/stop/compute/save
-// ----------------------------
+/* ----------------------------
+   Medición: start/stop/compute/save
+   (mantener endpoints y payload base)
+---------------------------- */
 async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
@@ -543,9 +659,13 @@ async function startMeasurement(){
   enableControls();
   setSensorChip();
 
-  chart.data.labels = [];
-  chart.data.datasets[0].data = [];
-  chart.update("none");
+  // limpiar chart
+  if(chart){
+    chart.data.labels = [];
+    chart.data.datasets[0].data = [];
+    chart.update("none");
+  }
+  chartQueue.length = 0;
 
   if(timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(async () => {
@@ -589,6 +709,7 @@ async function stopMeasurement(){
   };
 
   if(sensorType === "camera_ppg"){
+    // estimar fs real a partir de timestamps (más robusto)
     let fs = targetFps;
     if(ppgTimestamps.length > 10){
       const diffs = [];
@@ -610,6 +731,7 @@ async function stopMeasurement(){
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
+
     const metrics = await res.json();
     lastMetrics = metrics;
 
@@ -642,10 +764,10 @@ async function saveResult(){
     return;
   }
 
-  const studentId = document.getElementById("studentId").value;
-  const age = document.getElementById("age").value;
-  const comorbidities = document.getElementById("comorbidities").value;
-  const notes = document.getElementById("notes").value;
+  const studentId = document.getElementById("studentId")?.value ?? "";
+  const age = document.getElementById("age")?.value ?? "";
+  const comorbidities = document.getElementById("comorbidities")?.value ?? "";
+  const notes = document.getElementById("notes")?.value ?? "";
 
   const payload = {
     student_id: studentId,
@@ -674,9 +796,9 @@ async function saveResult(){
   }
 }
 
-// ----------------------------
-// Init
-// ----------------------------
+/* ----------------------------
+   Init
+---------------------------- */
 window.addEventListener("DOMContentLoaded", () => {
   initChart();
   setupDurationButtons();
@@ -685,8 +807,10 @@ window.addEventListener("DOMContentLoaded", () => {
   enableControls();
   buildCards(null);
   setQuality(null);
+  setTimerText();
+  setStatus("Listo", "idle");
 
-  document.getElementById("btnStart").addEventListener("click", async () => {
+  document.getElementById("btnStart")?.addEventListener("click", async () => {
     if(measuring) return;
     try{
       await startMeasurement();
@@ -697,11 +821,11 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  document.getElementById("btnStop").addEventListener("click", async () => {
+  document.getElementById("btnStop")?.addEventListener("click", async () => {
     await stopMeasurement();
   });
 
-  document.getElementById("btnSave").addEventListener("click", async () => {
+  document.getElementById("btnSave")?.addEventListener("click", async () => {
     await saveResult();
   });
 });
