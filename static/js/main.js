@@ -1,4 +1,3 @@
-// static/js/main.js  (COMPLETO)  — NO cambia IDs ni nombres de funciones existentes
 let selectedDurationMin = 3;
 let measuring = false;
 let sensorType = "camera_ppg";
@@ -26,26 +25,10 @@ let lastMetrics = null;
 // Chart.js
 let chart = null;
 
-// Real-time quality
-let qualityScore = 0;
-let qualityText = "—";
-let qualityLevel = "idle";
-
-// ===== ECG glow plugin (Chart.js) =====
-const ecgGlowPlugin = {
-  id: "ecgGlow",
-  beforeDatasetsDraw(chartInstance, args, pluginOptions) {
-    const { ctx } = chartInstance;
-    ctx.save();
-    ctx.shadowColor = pluginOptions.shadowColor || "rgba(255, 43, 43, 0.70)";
-    ctx.shadowBlur = pluginOptions.shadowBlur || 18;
-    ctx.shadowOffsetX = 0;
-    ctx.shadowOffsetY = 0;
-  },
-  afterDatasetsDraw(chartInstance) {
-    chartInstance.ctx.restore();
-  }
-};
+// Calidad señal (frontend)
+let qualityScore = 0; // 0..100
+let qualityWindow = []; // últimos N samples (para estimar)
+let qualityLastUpdate = 0;
 
 function setStatus(text, level="idle"){
   const dot = document.getElementById("statusDot");
@@ -60,7 +43,7 @@ function setStatus(text, level="idle"){
     dot.style.boxShadow = "0 0 0 4px rgba(251,191,36,0.16)";
   } else if(level === "bad"){
     dot.style.background = "var(--bad)";
-    dot.style.boxShadow = "0 0 0 4px rgba(251,113,133,0.16)";
+    dot.style.boxShadow = "0 0 0 4px rgba(255,43,43,0.18)";
   } else {
     dot.style.background = "var(--muted)";
     dot.style.boxShadow = "0 0 0 4px rgba(149,163,183,0.12)";
@@ -85,49 +68,30 @@ function setTimerText(){
 
 function setSensorChip(){
   const chip = document.getElementById("chipSensor");
-  chip.textContent =
-    sensorType === "polar_h10" ? "Sensor: Polar H10 (BLE)" :
-    sensorType === "ant_group" ? "Sensor: ANT+ Grupo (Bridge)" :
-    "Sensor: Cámara (PPG)";
-}
-
-/* ✅ Mantiene el nombre setQualityChip, pero ahora controla una barra */
-function setQualityChip(){
-  const root = document.getElementById("chipQuality");
-  if(!root) return;
-
-  const fill = root.querySelector(".quality-fill");
-  const valueEl = document.getElementById("qualityValue");
-
-  const clamped = Math.max(0, Math.min(100, Number(qualityScore) || 0));
-  if(fill) fill.style.width = `${clamped}%`;
-  if(valueEl) valueEl.textContent = `${Math.round(clamped)}%`;
-
-  // Texto/hint de calidad (sin cambiar IDs)
-  const hint = document.getElementById("qualityHint");
-  if(hint){
-    if(qualityLevel === "ok") hint.textContent = "Señal buena: mantené el dedo firme y sin movimiento.";
-    else if(qualityLevel === "warn") hint.textContent = "Señal moderada: ajustá presión y evitá movimiento.";
-    else if(qualityLevel === "bad") hint.textContent = "Señal mala: más estabilidad / mejor contacto / menos movimiento.";
-    else hint.textContent = "Mantener dedo firme, sin presión excesiva y sin movimiento.";
-  }
+  chip.textContent = sensorType === "polar_h10" ? "Sensor: Polar H10 (BLE)" : "Sensor: Cámara (PPG)";
 }
 
 function enableControls(){
-  const startBtn = document.getElementById("btnStart");
-  const stopBtn = document.getElementById("btnStop");
-  const saveBtn = document.getElementById("btnSave");
-
-  const antSelected = (sensorType === "ant_group");
-  // ANT+ Grupo (bridge) no está implementado en este frontend
-  startBtn.disabled = measuring || antSelected;
-  stopBtn.disabled = !measuring;
-  saveBtn.disabled = measuring || !lastMetrics || !!lastMetrics.error;
-
-  if(antSelected){
-    setStatus("ANT+ Grupo requiere Bridge (no realtime en web).", "warn");
-  }
+  document.getElementById("btnStart").disabled = measuring;
+  document.getElementById("btnStop").disabled = !measuring;
+  document.getElementById("btnSave").disabled = measuring || !lastMetrics || !!lastMetrics.error;
 }
+
+/* Glow rojo para Chart.js (sin cambiar IDs) */
+const glowPlugin = {
+  id: "glowPlugin",
+  beforeDatasetsDraw(chart, args, pluginOptions){
+    const { ctx } = chart;
+    ctx.save();
+    ctx.shadowColor = "rgba(255, 43, 43, 0.55)";
+    ctx.shadowBlur = 14;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  },
+  afterDatasetsDraw(chart){
+    chart.ctx.restore();
+  }
+};
 
 function initChart(){
   const ctx = document.getElementById("signalChart");
@@ -139,8 +103,8 @@ function initChart(){
         label: "ECG",
         data: [],
         pointRadius: 0,
-        borderWidth: 2.6,
-        tension: 0.25,
+        borderWidth: 3,
+        tension: 0.18,
         borderColor: "#ff2b2b"
       }]
     },
@@ -148,24 +112,22 @@ function initChart(){
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      plugins: {
-        legend: { display: false },
-        ecgGlow: { shadowColor: "rgba(255, 43, 43, 0.70)", shadowBlur: 18 }
-      },
+      plugins: { legend: { display: false } },
       scales: {
         x: { display: false },
-        y: { display: false }
-      },
-      elements: {
-        line: { capBezierPoints: true }
+        y: {
+          display: false,
+          suggestedMin: -2,
+          suggestedMax: 2
+        }
       }
     },
-    plugins: [ecgGlowPlugin]
+    plugins: [glowPlugin]
   });
 }
 
 function pushChartPoint(value){
-  const maxPoints = 420;
+  const maxPoints = 320;
   chart.data.labels.push("");
   chart.data.datasets[0].data.push(value);
   if(chart.data.labels.length > maxPoints){
@@ -192,26 +154,28 @@ function setupSensorSelector(){
   sel.addEventListener("change", () => {
     sensorType = sel.value;
     setSensorChip();
-    enableControls();
+    setStatus("Listo", "idle");
   });
+}
 
-  // UI moderno (pills) -> actualiza el select original
-  const pills = Array.from(document.querySelectorAll(".sensor-pill"));
-  pills.forEach(btn => {
-    btn.addEventListener("click", () => {
-      const v = btn.getAttribute("data-value");
-      if(!v) return;
+/* Barra de calidad (sin cambiar IDs existentes) */
+function setQuality(score, text){
+  const fill = document.getElementById("qualityFill");
+  const label = document.getElementById("qualityLabel");
+  const hint = document.getElementById("qualityHint");
 
-      pills.forEach(x => x.classList.toggle("active", x === btn));
+  const s = Math.max(0, Math.min(100, Math.round(score)));
+  fill.style.width = `${s}%`;
 
-      sel.value = v;
-      sel.dispatchEvent(new Event("change"));
-    });
-  });
+  label.textContent = text || `${s}%`;
 
-  // Estado inicial sincronizado
-  const initial = sel.value || "camera_ppg";
-  pills.forEach(x => x.classList.toggle("active", x.getAttribute("data-value") === initial));
+  if(s >= 75){
+    hint.textContent = "Señal buena. Mantené el dedo firme.";
+  } else if(s >= 45){
+    hint.textContent = "Señal media. Presioná un poco más y evitá mover el dedo.";
+  } else {
+    hint.textContent = "Señal baja. Tapá completamente el lente + flash/linterna y evitá movimiento.";
+  }
 }
 
 function buildCards(metrics){
@@ -228,21 +192,22 @@ function buildCards(metrics){
     return;
   }
 
-  if(metrics.freq_warning) freqHint.textContent = metrics.freq_warning;
-  if(metrics.quality_warning) freqHint.textContent = metrics.quality_warning;
+  if(metrics.freq_warning){
+    freqHint.textContent = metrics.freq_warning;
+  }
 
   if(metrics.error){
     const c = document.createElement("div");
     c.className = "card bad";
-    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / movimiento</div>`;
+    c.innerHTML = `<div class="k">ERROR</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / movimiento</div>`;
     cards.appendChild(c);
     return;
   }
 
   const items = [
-    {k:"HRV score", v: metrics.hrv_score, u:"/100"},
-    {k:"HR media", v: metrics.hr_mean, u:"bpm"},
-    {k:"HR máxima", v: metrics.hr_max, u:"bpm"},
+    {k:"HR (Media)", v: metrics.hr_mean, u:"bpm"},
+    {k:"HR (Máx)", v: metrics.hr_max, u:"bpm"},
+    {k:"HR (Mín)", v: metrics.hr_min, u:"bpm"},
     {k:"RMSSD", v: metrics.rmssd, u:"ms"},
     {k:"SDNN", v: metrics.sdnn, u:"ms"},
     {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)"},
@@ -252,13 +217,14 @@ function buildCards(metrics){
     {k:"HF Power", v: metrics.hf_power, u:"ms²"},
     {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
     {k:"Total Power", v: metrics.total_power, u:"ms²"},
+    {k:"Resp (est.)", v: metrics.resp_rate_rpm, u:"rpm"},
     {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
   ];
 
   items.forEach(it => {
     const num = typeof it.v === "number" ? it.v : Number(it.v);
     const isNum = Number.isFinite(num);
-    const val = isNum ? num.toFixed(2) : "—";
+    const val = isNum ? (it.k.includes("LF/HF") ? num.toFixed(2) : num.toFixed(1)) : "—";
 
     let cls = "card";
     if(it.k === "Artefactos" && isNum){
@@ -275,40 +241,7 @@ function buildCards(metrics){
 }
 
 // ----------------------------
-// Señal: Calidad en vivo (mismo nombre de función)
-// ----------------------------
-function computeLiveQuality(recent){
-  if(!recent || recent.length < 60) return {score: 0, text: "—", level: "idle"};
-
-  const x = recent.slice(-220);
-  const mean = x.reduce((a,b)=>a+b,0) / x.length;
-  const v = x.reduce((a,b)=>a+(b-mean)*(b-mean),0) / x.length;
-  const std = Math.sqrt(v);
-
-  let diffMean = 0;
-  for(let i=1;i<x.length;i++) diffMean += Math.abs(x[i]-x[i-1]);
-  diffMean /= (x.length-1);
-
-  const s1 = Math.min(std / 0.018, 1.0);
-  const m1 = Math.max(1.0 - (diffMean / 0.06), 0);
-
-  const score = Math.round((0.65*s1 + 0.35*m1) * 100);
-
-  let level = "warn";
-  if(score >= 72) level="ok";
-  else if(score >= 45) level="warn";
-  else level="bad";
-
-  return {score, text:`${score}%`, level};
-}
-
-function toEcgDisplayValue(v){
-  // “ECG look”: compresión suave + realce
-  return Math.tanh(v * 10) * 2.2;
-}
-
-// ----------------------------
-// Cámara PPG
+// Cámara PPG (tolerante + calidad realtime)
 // ----------------------------
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
@@ -317,10 +250,13 @@ async function startCameraPPG(){
 
   ppgSamples = [];
   ppgTimestamps = [];
+  qualityWindow = [];
+  qualityScore = 0;
+  setQuality(0, "—");
 
   mediaStream = await navigator.mediaDevices.getUserMedia({
     video: {
-      facingMode: { ideal: "environment" },
+      facingMode: "environment",
       frameRate: { ideal: 60, min: 24 },
       width: { ideal: 1280 },
       height: { ideal: 720 }
@@ -334,15 +270,16 @@ async function startCameraPPG(){
 
   try { await videoEl.play(); } catch(_e) {}
 
+  // esperar frames reales
   const t0 = Date.now();
   while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
     await new Promise(r => setTimeout(r, 50));
   }
   if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-    throw new Error("Cámara autorizada pero sin frames.");
+    throw new Error("Cámara autorizada pero sin frames (revisá permisos / Chrome real).");
   }
 
-  // Torch si existe
+  // torch si existe
   let torchOn = false;
   const track = mediaStream.getVideoTracks()[0];
   try{
@@ -353,14 +290,20 @@ async function startCameraPPG(){
     }
   }catch(_e){}
 
-  setStatus(torchOn ? "Cámara + torch ON • PPG" : "Cámara activa • PPG", torchOn ? "ok" : "warn");
-
   const w = 160, h = 120;
   frameCanvas.width = w;
   frameCanvas.height = h;
 
+  setStatus(torchOn ? "Cámara trasera + torch ON • recolectando PPG" : "Cámara trasera • recolectando PPG", torchOn ? "ok" : "warn");
+
   const intervalMs = Math.round(1000 / targetFps);
+
+  // extracción robusta:
+  // - meanR
+  // - AC = meanR - runningMean
+  // - normalizado: AC/DC
   let runningMean = null;
+  let runningVar = 0;
 
   cameraLoopHandle = setInterval(() => {
     if(!measuring) return;
@@ -376,18 +319,69 @@ async function startCameraPPG(){
     runningMean = 0.97 * runningMean + 0.03 * meanR;
 
     const ac = meanR - runningMean;
-    const normalized = (runningMean !== 0) ? (ac / runningMean) : 0;
+    const norm = (runningMean !== 0) ? (ac / runningMean) : 0;
 
-    ppgSamples.push(normalized);
+    // suavizado simple para curva fluida
+    const last = ppgSamples.length ? ppgSamples[ppgSamples.length-1] : 0;
+    const sm = 0.75 * last + 0.25 * norm;
+
+    ppgSamples.push(sm);
     ppgTimestamps.push(performance.now());
 
-    const q = computeLiveQuality(ppgSamples);
-    qualityScore = q.score;
-    qualityText = q.text;
-    qualityLevel = q.level;
-    setQualityChip();
+    // curva ECG-like (centrada y amplificada)
+    pushChartPoint(sm * 120);
 
-    pushChartPoint(toEcgDisplayValue(normalized));
+    // calidad (cada ~250ms)
+    qualityWindow.push(sm);
+    const maxW = Math.max(120, Math.round(targetFps * 6)); // 6s aprox
+    if(qualityWindow.length > maxW) qualityWindow.shift();
+
+    const now = performance.now();
+    if(now - qualityLastUpdate > 250){
+      qualityLastUpdate = now;
+
+      // métricas rápidas: var + “actividad pulsátil”
+      const n = qualityWindow.length;
+      if(n > Math.round(targetFps * 2)){
+        let m = 0;
+        for(let i=0;i<n;i++) m += qualityWindow[i];
+        m /= n;
+
+        let v = 0;
+        for(let i=0;i<n;i++){
+          const d = qualityWindow[i] - m;
+          v += d*d;
+        }
+        v /= n;
+
+        runningVar = 0.85 * runningVar + 0.15 * v;
+
+        // score: var moderada (no cero, no caos)
+        const varScore = Math.max(0, Math.min(1, (runningVar - 1e-6) / (2.5e-4))); // calibrado empírico
+        // penalizar saturación / oscuridad
+        const lightPenalty = (meanR < 8) ? 0.35 : 1.0;
+
+        // penalizar movimiento brusco (saltos)
+        let jumps = 0;
+        for(let i=1;i<n;i++){
+          if(Math.abs(qualityWindow[i]-qualityWindow[i-1]) > 0.05) jumps++;
+        }
+        const jumpRate = jumps / Math.max(n-1,1);
+        const motionPenalty = 1.0 - Math.max(0, Math.min(0.55, jumpRate * 2.2));
+
+        const raw = 100 * varScore * lightPenalty * motionPenalty;
+        qualityScore = 0.7 * qualityScore + 0.3 * raw;
+
+        let label = `${Math.round(qualityScore)}%`;
+        if(qualityScore >= 75) label = "BUENA";
+        else if(qualityScore >= 45) label = "MEDIA";
+        else label = "BAJA";
+
+        setQuality(qualityScore, label);
+      } else {
+        setQuality(0, "—");
+      }
+    }
   }, intervalMs);
 }
 
@@ -439,7 +433,7 @@ async function connectPolarH10(){
     throw new Error("Web Bluetooth no disponible en este navegador.");
   }
 
-  setStatus("Emparejando Polar H10…", "warn");
+  setStatus("Buscando Polar H10…", "warn");
 
   bleDevice = await navigator.bluetooth.requestDevice({
     filters: [{ services: ["heart_rate"] }]
@@ -463,12 +457,13 @@ async function connectPolarH10(){
     if(rrs.length){
       rrs.forEach(rr => {
         rrIntervalsMs.push(rr);
-        pushChartPoint(rr / 1000.0);
+        // curva tipo ECG también: mapear RR a variación visual suave
+        pushChartPoint((60_000 / rr - 60) * 2.0);
       });
     }
   });
 
-  setStatus("Polar conectado • RR", "ok");
+  setStatus("Polar H10 conectado • recolectando RR", "ok");
 }
 
 async function startPolarH10(){
@@ -495,38 +490,21 @@ async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
 
-  // reset chart
-  chart.data.labels = [];
-  chart.data.datasets[0].data = [];
-  chart.update("none");
-
-  // reset quality
-  qualityScore = 0; qualityText="—"; qualityLevel="idle";
-  setQualityChip();
-
-  setSensorChip();
-  enableControls();
-
+  // bloquear ANT+ (no implementado acá)
   if(sensorType === "ant_group"){
-    // no rompe nada: solo bloquea inicio en web
-    setStatus("ANT+ Grupo requiere Bridge (no realtime en web).", "warn");
+    setStatus("ANT+ Grupo: próximamente", "warn");
     return;
-  }
-
-  // conectar primero, luego iniciar medición
-  if(sensorType === "polar_h10"){
-    measuring = false;
-    enableControls();
-    await startPolarH10();
-  } else {
-    measuring = false;
-    enableControls();
-    await startCameraPPG();
   }
 
   measuring = true;
   startedAt = Date.now();
   enableControls();
+  setSensorChip();
+
+  // Reset chart
+  chart.data.labels = [];
+  chart.data.datasets[0].data = [];
+  chart.update("none");
 
   if(timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(async () => {
@@ -537,7 +515,11 @@ async function startMeasurement(){
     }
   }, 250);
 
-  setTimerText();
+  if(sensorType === "camera_ppg"){
+    await startCameraPPG();
+  } else {
+    await startPolarH10();
+  }
 }
 
 async function stopMeasurement(){
@@ -599,7 +581,7 @@ async function stopMeasurement(){
       if(Number.isFinite(art)){
         if(art <= 8) setStatus("Cálculo OK • Calidad buena", "ok");
         else if(art <= 18) setStatus("Cálculo OK • Calidad moderada", "warn");
-        else setStatus("Cálculo OK • Calidad baja", "bad");
+        else setStatus("Cálculo OK • Calidad baja (artefactos altos)", "bad");
       } else {
         setStatus("Cálculo OK", "ok");
       }
@@ -632,7 +614,7 @@ async function saveResult(){
     metrics: lastMetrics
   };
 
-  setStatus("Guardando…", "warn");
+  setStatus("Guardando en dataset_hba.csv…", "warn");
 
   try{
     const res = await fetch("/api/save", {
@@ -642,7 +624,7 @@ async function saveResult(){
     });
     const out = await res.json();
     if(out.ok){
-      setStatus("Guardado OK", "ok");
+      setStatus("Guardado OK • dataset_hba.csv actualizado", "ok");
     } else {
       setStatus("No se pudo guardar", "bad");
     }
@@ -661,7 +643,7 @@ window.addEventListener("DOMContentLoaded", () => {
   setSensorChip();
   enableControls();
   buildCards(null);
-  setQualityChip();
+  setQuality(0, "—");
 
   document.getElementById("btnStart").addEventListener("click", async () => {
     if(measuring) return;
