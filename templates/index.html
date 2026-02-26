@@ -2,147 +2,253 @@
 <html lang="es">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>HBA Emocional - Fase 1 (Datos)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#070a10" />
+  <title>Método HBA • Monitor HRV</title>
+
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
   <link rel="stylesheet" href="/static/css/style.css" />
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- Chart.js (necesario para tu main.js) -->
+  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script defer src="/static/js/main.js"></script>
 </head>
 
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <div class="brand-mark">
-        <div class="brand-dot"></div>
-      </div>
-      <div>
-        <div class="brand-title">HBA Emocional</div>
-        <div class="brand-subtitle">Plataforma de Monitoreo Autonómico • Rehabilitación</div>
-      </div>
-    </div>
+  <div class="app">
 
-    <div class="status-pill" id="statusPill">
-      <span class="status-dot" id="statusDot"></span>
-      <span id="statusText">Listo</span>
-    </div>
-  </header>
-
-  <main class="container">
-    <section class="panel panel-glass">
-      <div class="panel-head">
-        <h2>Configuración de Registro</h2>
-        <div class="mini">
-          <span class="chip chip-dark" id="chipSensor">Sensor: Cámara (PPG)</span>
-          <span class="chip chip-dark chip-timer" id="chipTimer">00:00</span>
+    <!-- HEADER -->
+    <header class="topbar glass neon">
+      <div class="brand">
+        <div class="logoPulse" aria-hidden="true"></div>
+        <div class="brandText">
+          <div class="brandTitle">Método HBA</div>
+          <div class="brandSub">HRV • Monitor Clínico</div>
         </div>
       </div>
 
-      <div class="grid-2">
-        <div class="field">
-          <label>ID Alumno</label>
-          <input id="studentId" type="text" placeholder="Ej: A-1029" />
+      <div class="statusArea" role="status" aria-live="polite">
+        <div class="statusPill">
+          <span id="statusDot" class="statusDot" aria-hidden="true"></span>
+          <span id="statusText" class="statusText">Listo</span>
         </div>
-        <div class="field">
-          <label>Edad</label>
-          <input id="age" type="number" min="0" placeholder="Ej: 52" />
-        </div>
-      </div>
 
-      <div class="field">
-        <label>Comorbilidades</label>
-        <input id="comorbidities" type="text" placeholder="Ej: HTA, DM2, EPOC" />
-      </div>
-
-      <div class="grid-2">
-        <div class="field">
-          <label>Sensor</label>
-          <!-- ID intacto: sensorType -->
-          <select id="sensorType" class="select-modern">
-            <option value="camera_ppg">Cámara PPG</option>
-            <option value="polar_h10">Polar Bluetooth</option>
-            <option value="ant_group" disabled>ANT+ Grupo (próximamente)</option>
-          </select>
-          <div class="hint">
-            Polar H10 requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost.
+        <div class="chipRow" aria-label="Estado de medición">
+          <div class="chip" id="chipSensor">Sensor: Cámara (PPG)</div>
+          <div class="chip chipTimer" title="Tiempo transcurrido">
+            <span class="chipLabel">Tiempo</span>
+            <span id="chipTimer" class="chipValue">00:00</span>
           </div>
         </div>
+      </div>
+    </header>
 
-        <div class="field">
-          <label>Duración</label>
-          <div class="segmented segmented-strong">
-            <button class="seg-btn active" data-min="3" id="dur3">3 minutos</button>
-            <button class="seg-btn" data-min="5" id="dur5">5 minutos</button>
+    <!-- MAIN GRID -->
+    <main class="layout">
+
+      <!-- LEFT: LIVE MONITOR -->
+      <section class="panel glass neon panelLive" aria-label="Monitor en vivo">
+
+        <div class="panelHeader">
+          <h1 class="panelTitle">Monitor</h1>
+          <div class="panelHint">Señal en tiempo real (estilo ECG)</div>
+        </div>
+
+        <!-- Chart + Grid background -->
+        <div class="chartCard glass neon" aria-label="Gráfico ECG">
+          <div class="chartHeader">
+            <div class="chartTitle">Señal</div>
+
+            <!-- Indicador de calidad -->
+            <div class="qualityWrap" aria-label="Calidad de señal">
+              <div class="qualityMeta">
+                <span class="qualityLabel">Calidad</span>
+                <span id="qualityText" class="qualityText">—</span>
+              </div>
+              <div class="qualityBar" role="meter" aria-valuemin="0" aria-valuemax="100">
+                <div id="qualityFill" class="qualityFill"></div>
+              </div>
+            </div>
           </div>
-          <div class="hint">5 min recomendado para espectral (LF/HF) más estable.</div>
+
+          <div class="chartBody ecgGrid">
+            <canvas id="signalChart" class="signalChart" aria-label="Canvas de señal"></canvas>
+          </div>
+
+          <div id="freqHint" class="freqHint" aria-live="polite"></div>
         </div>
-      </div>
 
-      <div class="quality-wrap">
-        <div class="quality-head">
-          <div class="quality-title">Calidad de señal</div>
-          <div class="quality-badge" id="qualityLabel">—</div>
+        <!-- Camera preview (para PPG) -->
+        <div class="mediaRow">
+          <div class="mediaCard glass neon">
+            <div class="mediaHeader">
+              <div class="mediaTitle">Cámara PPG</div>
+              <div class="mediaSub">Colocá el dedo firme sobre el lente</div>
+            </div>
+
+            <div class="videoFrame">
+              <video id="video" class="video" playsinline muted></video>
+              <!-- Canvas de muestreo (oculto visualmente pero presente para tu JS) -->
+              <canvas id="frameCanvas" class="frameCanvas" aria-hidden="true"></canvas>
+              <div class="videoOverlay" aria-hidden="true">
+                <div class="reticle"></div>
+                <div class="reticleText">Mantener estable</div>
+              </div>
+            </div>
+
+            <div class="mediaFooter">
+              <div class="tinyNote">
+                Consejo: apoyá el codo, evitá movimiento, cubrí bien el lente.
+              </div>
+            </div>
+          </div>
+
+          <!-- Controls -->
+          <div class="controlsCard glass neon" aria-label="Controles de medición">
+            <div class="controlsHeader">
+              <div class="controlsTitle">Controles</div>
+              <div class="controlsSub">Optimizado para tablets • botones grandes</div>
+            </div>
+
+            <div class="formGrid">
+              <label class="field">
+                <span class="fieldLabel">Sensor</span>
+                <select id="sensorType" class="select">
+                  <option value="camera_ppg" selected>Cámara (PPG)</option>
+                  <option value="polar_h10">Polar H10 (BLE)</option>
+                </select>
+              </label>
+
+              <div class="field">
+                <span class="fieldLabel">Duración</span>
+                <div class="segmented" role="group" aria-label="Duración de medición">
+                  <button id="dur3" type="button" class="segBtn active">3 min</button>
+                  <button id="dur5" type="button" class="segBtn">5 min</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="actionRow">
+              <button id="btnStart" type="button" class="btn btnPrimary">
+                Iniciar
+              </button>
+              <button id="btnStop" type="button" class="btn btnDanger" disabled>
+                Detener
+              </button>
+              <button id="btnSave" type="button" class="btn btnAccent" disabled>
+                Guardar
+              </button>
+            </div>
+
+            <div class="divider"></div>
+
+            <div class="patientForm" aria-label="Datos del alumno/paciente">
+              <div class="patientTitle">Datos</div>
+
+              <label class="field">
+                <span class="fieldLabel">ID Alumno / Paciente</span>
+                <input id="studentId" class="input" type="text" inputmode="text" placeholder="Ej: A-102 / DNI / Código" autocomplete="off" />
+              </label>
+
+              <div class="twoCols">
+                <label class="field">
+                  <span class="fieldLabel">Edad</span>
+                  <input id="age" class="input" type="number" inputmode="numeric" min="0" max="120" placeholder="Ej: 72" />
+                </label>
+
+                <label class="field">
+                  <span class="fieldLabel">Comorbilidades</span>
+                  <input id="comorbidities" class="input" type="text" placeholder="Ej: HTA, DM2, EPOC" />
+                </label>
+              </div>
+
+              <label class="field">
+                <span class="fieldLabel">Notas</span>
+                <textarea id="notes" class="textarea" rows="3" placeholder="Observaciones clínicas, postura, medicación, etc."></textarea>
+              </label>
+            </div>
+          </div>
         </div>
-        <div class="quality-bar">
-          <div class="quality-fill" id="qualityFill" style="width:0%"></div>
+      </section>
+
+      <!-- RIGHT: DASHBOARD (multi-usuario visual + métricas) -->
+      <aside class="panel glass neon panelDash" aria-label="Dashboard multi-usuario">
+        <div class="panelHeader">
+          <h2 class="panelTitle">Dashboard</h2>
+          <div class="panelHint">Vista rápida de múltiples alumnos/pacientes</div>
         </div>
-        <div class="hint" id="qualityHint">Apoyá el dedo firme, sin movimiento. Esperá 5–10s para estabilizar.</div>
-      </div>
 
-      <div class="actions">
-        <button class="btn primary big" id="btnStart">Iniciar Medición</button>
-        <button class="btn big" id="btnStop" disabled>Detener</button>
-        <button class="btn success big" id="btnSave" disabled>Guardar Resultado</button>
-      </div>
+        <!-- Grid multi-usuario (visual, no rompe tu lógica actual) -->
+        <section class="dashGrid" aria-label="Pacientes en pantalla">
+          <article class="dashTile glass neon">
+            <div class="tileTop">
+              <div class="tileName">Paciente 01</div>
+              <div class="tileBadge ok">Listo</div>
+            </div>
+            <div class="tileMid">
+              <div class="miniStat"><span>HR</span><strong>—</strong></div>
+              <div class="miniStat"><span>RMSSD</span><strong>—</strong></div>
+              <div class="miniStat"><span>Artef.</span><strong>—</strong></div>
+            </div>
+            <div class="tileBar"><span class="tileBarFill"></span></div>
+          </article>
 
-      <div class="note">
-        <label>Notas (opcional)</label>
-        <input id="notes" type="text" placeholder="Ej: descanso previo, medicación, observaciones..." />
-      </div>
-    </section>
+          <article class="dashTile glass neon">
+            <div class="tileTop">
+              <div class="tileName">Paciente 02</div>
+              <div class="tileBadge warn">En cola</div>
+            </div>
+            <div class="tileMid">
+              <div class="miniStat"><span>HR</span><strong>—</strong></div>
+              <div class="miniStat"><span>RMSSD</span><strong>—</strong></div>
+              <div class="miniStat"><span>Artef.</span><strong>—</strong></div>
+            </div>
+            <div class="tileBar"><span class="tileBarFill"></span></div>
+          </article>
 
-    <section class="panel panel-monitor">
-      <div class="panel-head">
-        <h2>Monitor</h2>
-        <div class="mini">
-          <span class="chip chip-live">LIVE</span>
-        </div>
-      </div>
+          <article class="dashTile glass neon">
+            <div class="tileTop">
+              <div class="tileName">Paciente 03</div>
+              <div class="tileBadge">Libre</div>
+            </div>
+            <div class="tileMid">
+              <div class="miniStat"><span>HR</span><strong>—</strong></div>
+              <div class="miniStat"><span>RMSSD</span><strong>—</strong></div>
+              <div class="miniStat"><span>Artef.</span><strong>—</strong></div>
+            </div>
+            <div class="tileBar"><span class="tileBarFill"></span></div>
+          </article>
 
-      <!-- class ecg agregada, IDs intactas -->
-      <div class="chart-wrap ecg">
-        <canvas id="signalChart"></canvas>
-      </div>
+          <article class="dashTile glass neon">
+            <div class="tileTop">
+              <div class="tileName">Paciente 04</div>
+              <div class="tileBadge">Libre</div>
+            </div>
+            <div class="tileMid">
+              <div class="miniStat"><span>HR</span><strong>—</strong></div>
+              <div class="miniStat"><span>RMSSD</span><strong>—</strong></div>
+              <div class="miniStat"><span>Artef.</span><strong>—</strong></div>
+            </div>
+            <div class="tileBar"><span class="tileBarFill"></span></div>
+          </article>
+        </section>
 
-      <video id="video" playsinline autoplay muted class="hidden"></video>
-      <canvas id="frameCanvas" class="hidden"></canvas>
-    </section>
+        <!-- Métricas (tu main.js escribe acá) -->
+        <section class="results glass neon" aria-label="Métricas HRV">
+          <div class="resultsHeader">
+            <div class="resultsTitle">Métricas</div>
+            <div class="resultsSub">Calculadas por Python (NeuroKit2)</div>
+          </div>
 
-    <section class="panel panel-results">
-      <div class="panel-head">
-        <h2>Resultados Fisiológicos</h2>
-        <div class="hint" id="freqHint"></div>
-      </div>
+          <div id="cards" class="cards" aria-live="polite"></div>
+        </section>
+      </aside>
+    </main>
 
-      <div class="cards" id="cards"></div>
-    </section>
-
-    <!-- Dashboard multiusuario: oculto por defecto -->
-    <section class="panel hidden" id="multiUserContainer">
-      <div class="panel-head">
-        <h2>Multi-User</h2>
-        <div class="hint">Hasta 10 alumnos (vista rápida)</div>
-      </div>
-
-      <div class="multi-grid" id="multiGrid">
-        <!-- tarjetas se podrían renderizar luego -->
-      </div>
-    </section>
-  </main>
-
-  <footer class="footer">
-    <div>© HBA Emocional • Fase 1</div>
-    <div class="footer-hint">Uso científico / rehabilitación. No diagnóstico.</div>
-  </footer>
-
-  <script src="/static/js/main.js"></script>
+    <footer class="footer">
+      <div class="footerLeft">HBA • HRV</div>
+      <div class="footerRight">Modo Oscuro Profundo • UI clínica</div>
+    </footer>
+  </div>
 </body>
 </html>
