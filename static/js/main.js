@@ -23,9 +23,29 @@ let bleChar = null;
 let rrIntervalsMs = [];
 let lastMetrics = null;
 
-// Charts
+// Chart.js
 let chart = null;
-let trendChart = null;
+
+// Real-time quality
+let qualityScore = 0;
+let qualityText = "—";
+let qualityLevel = "idle";
+
+// ===== ECG glow plugin (Chart.js) =====
+const ecgGlowPlugin = {
+  id: "ecgGlow",
+  beforeDatasetsDraw(chartInstance, args, pluginOptions) {
+    const { ctx } = chartInstance;
+    ctx.save();
+    ctx.shadowColor = pluginOptions.shadowColor || "rgba(255, 43, 43, 0.55)";
+    ctx.shadowBlur = pluginOptions.shadowBlur || 12;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  },
+  afterDatasetsDraw(chartInstance) {
+    chartInstance.ctx.restore();
+  }
+};
 
 function setStatus(text, level="idle"){
   const dot = document.getElementById("statusDot");
@@ -68,6 +88,30 @@ function setSensorChip(){
   chip.textContent = sensorType === "polar_h10" ? "Sensor: Polar H10 (BLE)" : "Sensor: Cámara (PPG)";
 }
 
+function setQualityChip(){
+  const chip = document.getElementById("chipQuality");
+  chip.textContent = `Calidad: ${qualityText}`;
+
+  // color según nivel
+  if(qualityLevel === "ok"){
+    chip.style.borderColor = "rgba(52,211,153,0.35)";
+    chip.style.background = "rgba(52,211,153,0.10)";
+    chip.style.color = "var(--text)";
+  } else if(qualityLevel === "warn"){
+    chip.style.borderColor = "rgba(251,191,36,0.35)";
+    chip.style.background = "rgba(251,191,36,0.10)";
+    chip.style.color = "var(--text)";
+  } else if(qualityLevel === "bad"){
+    chip.style.borderColor = "rgba(251,113,133,0.35)";
+    chip.style.background = "rgba(251,113,133,0.10)";
+    chip.style.color = "var(--text)";
+  } else {
+    chip.style.borderColor = "rgba(255,255,255,0.10)";
+    chip.style.background = "rgba(11,18,32,0.55)";
+    chip.style.color = "var(--muted)";
+  }
+}
+
 function enableControls(){
   document.getElementById("btnStart").disabled = measuring;
   document.getElementById("btnStop").disabled = !measuring;
@@ -76,58 +120,39 @@ function enableControls(){
 
 function initChart(){
   const ctx = document.getElementById("signalChart");
+
   chart = new Chart(ctx, {
     type: "line",
     data: {
       labels: [],
       datasets: [{
-        label: "Señal",
+        label: "ECG",
         data: [],
         pointRadius: 0,
-        borderWidth: 2,
-        tension: 0.35
+        borderWidth: 2.2,
+        tension: 0.25,
+        borderColor: "#ff2b2b"
       }]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
-      plugins: { legend: { display: false } },
+      plugins: {
+        legend: { display: false },
+        ecgGlow: { shadowColor: "rgba(255, 43, 43, 0.55)", shadowBlur: 14 }
+      },
       scales: {
         x: { display: false },
-        y: { display: true, ticks: { color: "#98a6bf" } }
+        y: { display: false }
       }
-    }
-  });
-}
-
-function initTrendChart(){
-  const ctx = document.getElementById("trendChart");
-  trendChart = new Chart(ctx, {
-    type: "line",
-    data: {
-      labels: [],
-      datasets: [
-        { label: "RMSSD", data: [], pointRadius: 2, borderWidth: 2, tension: 0.25 },
-        { label: "HR media", data: [], pointRadius: 2, borderWidth: 2, tension: 0.25 },
-        { label: "HRV score", data: [], pointRadius: 2, borderWidth: 2, tension: 0.25 },
-      ]
     },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      animation: false,
-      plugins: { legend: { display: true, labels: { color: "#98a6bf" } } },
-      scales: {
-        x: { display: true, ticks: { color: "#98a6bf", maxRotation: 0, autoSkip: true } },
-        y: { display: true, ticks: { color: "#98a6bf" } }
-      }
-    }
+    plugins: [ecgGlowPlugin]
   });
 }
 
 function pushChartPoint(value){
-  const maxPoints = 320;
+  const maxPoints = 360;
   chart.data.labels.push("");
   chart.data.datasets[0].data.push(value);
   if(chart.data.labels.length > maxPoints){
@@ -175,6 +200,9 @@ function buildCards(metrics){
   if(metrics.freq_warning){
     freqHint.textContent = metrics.freq_warning;
   }
+  if(metrics.quality_warning){
+    freqHint.textContent = metrics.quality_warning;
+  }
 
   if(metrics.error){
     const c = document.createElement("div");
@@ -189,17 +217,14 @@ function buildCards(metrics){
     {k:"HR media", v: metrics.hr_mean, u:"bpm"},
     {k:"HR máxima", v: metrics.hr_max, u:"bpm"},
     {k:"RMSSD", v: metrics.rmssd, u:"ms"},
-
     {k:"SDNN", v: metrics.sdnn, u:"ms"},
     {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)"},
     {k:"pNN50", v: metrics.pnn50, u:"%"},
     {k:"Mean RR", v: metrics.mean_rr, u:"ms"},
-
     {k:"LF Power", v: metrics.lf_power, u:"ms²"},
     {k:"HF Power", v: metrics.hf_power, u:"ms²"},
     {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
     {k:"Total Power", v: metrics.total_power, u:"ms²"},
-
     {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
   ];
 
@@ -210,8 +235,8 @@ function buildCards(metrics){
 
     let cls = "card";
     if(it.k === "Artefactos" && isNum){
-      if(num <= 5) cls += " good";
-      else if(num <= 12) cls += " warn";
+      if(num <= 8) cls += " good";
+      else if(num <= 18) cls += " warn";
       else cls += " bad";
     }
 
@@ -223,7 +248,52 @@ function buildCards(metrics){
 }
 
 // ----------------------------
-// Cámara PPG (menos estricta)
+// Señal: “ECG-look” + Calidad en vivo
+// ----------------------------
+function computeLiveQuality(recent){
+  // recent: array de valores normalizados (AC/DC)
+  if(!recent || recent.length < 60) return {score: 0, text: "—", level: "idle"};
+
+  const x = recent.slice(-180);
+  const mean = x.reduce((a,b)=>a+b,0) / x.length;
+  const v = x.reduce((a,b)=>a+(b-mean)*(b-mean),0) / x.length;
+  const std = Math.sqrt(v);
+
+  // "movimiento": variación excesiva entre muestras
+  let diffMean = 0;
+  for(let i=1;i<x.length;i++) diffMean += Math.abs(x[i]-x[i-1]);
+  diffMean /= (x.length-1);
+
+  // heurística simple:
+  // - std muy bajo => no hay pulso (malo)
+  // - diff muy alto => movimiento (malo)
+  // - zona media => ok
+  let score = 0;
+
+  const s1 = Math.min(std / 0.02, 1.0);            // señal (0..1)
+  const m1 = Math.max(1.0 - (diffMean / 0.05), 0); // movimiento (0..1, más alto mejor)
+
+  score = Math.round((0.65*s1 + 0.35*m1) * 100);
+
+  let level = "warn";
+  let text = `${score}%`;
+
+  if(score >= 70){ level="ok"; }
+  else if(score >= 45){ level="warn"; }
+  else { level="bad"; }
+
+  return {score, text, level};
+}
+
+// “ECG look”: hacemos un realce simple (derivada + compresión) SOLO para display
+function toEcgDisplayValue(v){
+  // compresión suave
+  const y = Math.tanh(v * 8);
+  return y * 2.0;
+}
+
+// ----------------------------
+// Cámara PPG
 // ----------------------------
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
@@ -272,7 +342,7 @@ async function startCameraPPG(){
   frameCanvas.width = w;
   frameCanvas.height = h;
 
-  setStatus(torchOn ? "Cámara + torch ON • recolectando PPG" : "Cámara activa • recolectando PPG", torchOn ? "ok" : "warn");
+  setStatus(torchOn ? "Cámara + torch ON • PPG" : "Cámara activa • PPG", torchOn ? "ok" : "warn");
 
   const intervalMs = Math.round(1000 / targetFps);
 
@@ -292,15 +362,21 @@ async function startCameraPPG(){
     runningMean = 0.97 * runningMean + 0.03 * meanR;
 
     const ac = meanR - runningMean;
-
-    // gráfico: amplificado
-    pushChartPoint(ac * 80);
-
-    // backend: señal normalizada (AC/DC)
     const normalized = (runningMean !== 0) ? (ac / runningMean) : 0;
 
+    // guardar para backend
     ppgSamples.push(normalized);
     ppgTimestamps.push(performance.now());
+
+    // quality live
+    const q = computeLiveQuality(ppgSamples);
+    qualityScore = q.score;
+    qualityText = q.text;
+    qualityLevel = q.level;
+    setQualityChip();
+
+    // display (ECG)
+    pushChartPoint(toEcgDisplayValue(normalized));
   }, intervalMs);
 }
 
@@ -321,7 +397,7 @@ function stopCameraPPG(){
 }
 
 // ----------------------------
-// Polar H10 BLE
+// Polar H10 BLE (igual)
 // ----------------------------
 function parseHeartRateMeasurement(value){
   const flags = value.getUint8(0);
@@ -376,12 +452,12 @@ async function connectPolarH10(){
     if(rrs.length){
       rrs.forEach(rr => {
         rrIntervalsMs.push(rr);
-        pushChartPoint(rr); // RR curve
+        pushChartPoint(rr / 1000.0); // display
       });
     }
   });
 
-  setStatus("Polar conectado • recolectando RR", "ok");
+  setStatus("Polar conectado • RR", "ok");
 }
 
 async function startPolarH10(){
@@ -402,62 +478,38 @@ async function stopPolarH10(){
 }
 
 // ----------------------------
-// Tendencias (CSV history)
-// ----------------------------
-async function loadTrend(){
-  const studentId = document.getElementById("studentId").value.trim();
-  if(!studentId || !trendChart) return;
-
-  try{
-    const res = await fetch(`/api/history?student_id=${encodeURIComponent(studentId)}`);
-    const data = await res.json();
-    if(!data.ok) return;
-
-    const items = data.items || [];
-    const labels = items.map(x => (x.t || "").slice(5,10)); // MM-DD
-    const rmssd = items.map(x => Number(x.rmssd));
-    const hr = items.map(x => Number(x.hr_mean));
-    const score = items.map(x => Number(x.hrv_score));
-
-    trendChart.data.labels = labels;
-    trendChart.data.datasets[0].data = rmssd.map(v => Number.isFinite(v) ? v : null);
-    trendChart.data.datasets[1].data = hr.map(v => Number.isFinite(v) ? v : null);
-    trendChart.data.datasets[2].data = score.map(v => Number.isFinite(v) ? v : null);
-    trendChart.update("none");
-  }catch(_e){}
-}
-
-// ----------------------------
-// Medición (NO arranca timer hasta que conecte)
+// Medición start/stop/compute/save
 // ----------------------------
 async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
 
-  // Reset charts
+  // Reset chart
   chart.data.labels = [];
   chart.data.datasets[0].data = [];
   chart.update("none");
 
-  setSensorChip();
+  // reset quality
+  qualityScore = 0;
+  qualityText = "—";
+  qualityLevel = "idle";
+  setQualityChip();
 
+  // conectar primero, luego iniciar medición
   if(sensorType === "polar_h10"){
-    // conectar primero, recién después inicia timer/medición
     measuring = false;
     enableControls();
     await startPolarH10();
-  }
-
-  if(sensorType === "camera_ppg"){
+  } else {
     measuring = false;
     enableControls();
     await startCameraPPG();
   }
 
-  // Ahora sí empieza medición real
   measuring = true;
   startedAt = Date.now();
   enableControls();
+  setSensorChip();
 
   if(timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(async () => {
@@ -489,7 +541,7 @@ async function stopMeasurement(){
     await stopPolarH10();
   }
 
-  setStatus("Procesando…", "warn");
+  setStatus("Procesando HRV…", "warn");
 
   let payload = {
     sensor_type: sensorType,
@@ -528,15 +580,13 @@ async function stopMeasurement(){
     } else {
       const art = Number(metrics.artifact_percent);
       if(Number.isFinite(art)){
-        if(art <= 5) setStatus("OK • Calidad buena", "ok");
-        else if(art <= 12) setStatus("OK • Calidad moderada", "warn");
-        else setStatus("OK • Calidad baja (artefactos altos)", "bad");
+        if(art <= 8) setStatus("Cálculo OK • Calidad buena", "ok");
+        else if(art <= 18) setStatus("Cálculo OK • Calidad moderada", "warn");
+        else setStatus("Cálculo OK • Calidad baja", "bad");
       } else {
-        setStatus("OK", "ok");
+        setStatus("Cálculo OK", "ok");
       }
     }
-
-    await loadTrend();
   }catch(e){
     lastMetrics = { error: e.message || String(e) };
     buildCards(lastMetrics);
@@ -565,7 +615,7 @@ async function saveResult(){
     metrics: lastMetrics
   };
 
-  setStatus("Guardando…", "warn");
+  setStatus("Guardando en dataset_hba.csv…", "warn");
 
   try{
     const res = await fetch("/api/save", {
@@ -575,8 +625,7 @@ async function saveResult(){
     });
     const out = await res.json();
     if(out.ok){
-      setStatus("Guardado OK • CSV actualizado", "ok");
-      await loadTrend();
+      setStatus("Guardado OK • dataset_hba.csv actualizado", "ok");
     } else {
       setStatus("No se pudo guardar", "bad");
     }
@@ -588,15 +637,14 @@ async function saveResult(){
 // ----------------------------
 // Init
 // ----------------------------
-window.addEventListener("DOMContentLoaded", async () => {
+window.addEventListener("DOMContentLoaded", () => {
   initChart();
-  initTrendChart();
   setupDurationButtons();
   setupSensorSelector();
   setSensorChip();
   enableControls();
   buildCards(null);
-  await loadTrend();
+  setQualityChip();
 
   document.getElementById("btnStart").addEventListener("click", async () => {
     if(measuring) return;
@@ -615,9 +663,5 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   document.getElementById("btnSave").addEventListener("click", async () => {
     await saveResult();
-  });
-
-  document.getElementById("studentId").addEventListener("change", async () => {
-    await loadTrend();
   });
 });
