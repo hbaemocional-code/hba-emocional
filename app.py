@@ -52,7 +52,7 @@ def _sanitize_for_json(obj):
 def clean_rri_ms(rri_ms: np.ndarray):
     """
     Limpieza/corrección de RR (ms):
-    - Rechazo fisiológico: 300–2000 ms
+    - Rechazo fisiológico (más tolerante): 250–2200 ms
     - Outliers robustos (MAD)
     - Corrección por interpolación
     """
@@ -61,14 +61,15 @@ def clean_rri_ms(rri_ms: np.ndarray):
     if len(rri_ms) < 10:
         return rri_ms, np.nan, np.zeros(len(rri_ms), dtype=bool)
 
-    bad = (rri_ms < 300) | (rri_ms > 2000)
+    bad = (rri_ms < 250) | (rri_ms > 2200)
 
     base = rri_ms[~bad] if np.any(~bad) else rri_ms
     med = np.median(base)
     mad = np.median(np.abs(base - med)) + 1e-9
 
     robust_z = 0.6745 * (rri_ms - med) / mad
-    bad = bad | (np.abs(robust_z) > 4.5)  # más tolerante que 3.5
+    # tolerante: 4.5
+    bad = bad | (np.abs(robust_z) > 4.5)
 
     artifact_percent = 100.0 * (np.sum(bad) / len(rri_ms))
 
@@ -91,6 +92,10 @@ def clean_rri_ms(rri_ms: np.ndarray):
 
 
 def rri_to_peaks(rri_ms: np.ndarray, sampling_rate=1000):
+    """
+    Convierte RR (ms) a un tren binario de picos (0/1) a sampling_rate Hz.
+    Útil como fallback para versiones de NeuroKit2 que exigen peaks.
+    """
     rri_ms = _finite_array(rri_ms)
     if len(rri_ms) < 3:
         return None
@@ -113,9 +118,9 @@ def rri_to_peaks(rri_ms: np.ndarray, sampling_rate=1000):
 def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
     rri_ms = _finite_array(rri_ms)
 
-    if len(rri_ms) < 20:
+    if len(rri_ms) < 12:
         return {
-            "error": "Insuficientes intervalos RR (mínimo recomendado: 20).",
+            "error": "Insuficientes intervalos RR (mínimo recomendado: 12).",
             "artifact_percent": np.nan
         }
 
@@ -127,13 +132,16 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
     hr_max = float(np.nanmax(hr_series)) if len(hr_series) else np.nan
     hr_min = float(np.nanmin(hr_series)) if len(hr_series) else np.nan
 
+    hrv_mode = "rri"
     try:
         hrv_time = nk.hrv_time(rri=rri_clean, show=False)
         hrv_freq = nk.hrv_frequency(rri=rri_clean, show=False)
     except Exception:
+        # fallback a peaks binario para compatibilidad NK2
         peaks = rri_to_peaks(rri_clean, sampling_rate=1000)
         if peaks is None:
             return {"error": "No se pudo construir tren de picos desde RR.", "artifact_percent": artifact_percent}
+        hrv_mode = "peaks"
         hrv_time = nk.hrv_time(peaks, sampling_rate=1000, show=False)
         hrv_freq = nk.hrv_frequency(peaks, sampling_rate=1000, show=False)
 
@@ -178,7 +186,8 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
         "hr_mean": hr_mean,
         "hr_max": hr_max,
         "hr_min": hr_min,
-        "freq_warning": freq_warning
+        "freq_warning": freq_warning,
+        "hrv_mode": hrv_mode
     }
 
 
@@ -188,13 +197,12 @@ def _resp_rate_from_ppg_fft(ppg: np.ndarray, sampling_rate: float):
     Devuelve respiraciones/min (rpm). Si no es estable, devuelve NaN.
     """
     try:
-        # banda típica respiración 0.1–0.4 Hz (6–24 rpm)
         rsp = nk.signal_filter(ppg, sampling_rate=sampling_rate, lowcut=0.1, highcut=0.4, method="butterworth", order=3)
         rsp = np.asarray(rsp, dtype=float)
         rsp = rsp - np.nanmean(rsp)
 
         n = len(rsp)
-        if n < int(sampling_rate * 60):  # mínimo 60s para FFT con algo de sentido
+        if n < int(sampling_rate * 60):
             return np.nan
 
         freqs = np.fft.rfftfreq(n, d=1.0 / sampling_rate)
@@ -215,15 +223,16 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     """
     HRV desde PPG (cámara):
     - Filtrado tolerante (0.5–8.0 Hz)
-    - Detección de picos robusta: elgendi
-    - Fixpeaks + artefactos más tolerantes
-    - HR mean/max/min + estimación FR (opcional)
+    - Peaks elgendi
+    - Fixpeaks + limpieza RR
+    - HRV:
+        - intenta con rri=...
+        - si falla (NK2 exige peaks): fallback a peaks binario construido desde RR
     """
     ppg = _finite_array(ppg)
     if sampling_rate is None or not np.isfinite(sampling_rate) or sampling_rate <= 1:
         return {"error": "sampling_rate inválido."}
 
-    # mínimo absoluto más tolerante
     min_seconds = 45
     if len(ppg) < int(sampling_rate * min_seconds):
         return {"error": f"PPG insuficiente (mínimo {min_seconds}s). Recomendado 3–5 min."}
@@ -234,7 +243,7 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     std = np.nanstd(ppg) + 1e-9
     ppg = ppg / std
 
-    # filtro tolerante (pedidos: lowcut=0.5, highcut=8.0)
+    # filtro tolerante
     try:
         ppg_f = nk.signal_filter(
             ppg,
@@ -252,7 +261,6 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
         _peaks, info = nk.ppg_peaks(ppg_f, sampling_rate=sampling_rate, method="elgendi")
         peaks_idx = info.get("PPG_Peaks", None)
         if peaks_idx is None:
-            # fallback si viene en otra clave/estructura
             peaks_idx = info.get("peaks", None)
 
         if peaks_idx is None:
@@ -266,7 +274,7 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     except Exception as e:
         return {"error": f"Fallo detectando picos PPG (elgendi): {str(e)}"}
 
-    # Fixpeaks (más tolerante) + % cambios
+    # Fixpeaks (tolerante)
     artifact_percent = np.nan
     try:
         fixed = nk.signal_fixpeaks(peaks_idx, sampling_rate=sampling_rate, iterative=True, show=False)
@@ -276,7 +284,6 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
             set_b = set(peaks_idx.tolist())
             set_a = set(fixed_idx.tolist())
             changed = len(set_b.symmetric_difference(set_a))
-            # más tolerante: cambios relativos vs total picos
             artifact_percent = 100.0 * (changed / max(len(set_b), 1))
             peaks_idx_used = fixed_idx
         else:
@@ -284,21 +291,16 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     except Exception:
         peaks_idx_used = peaks_idx
 
-    # RR + HR
+    # RR (ms) sin filtrar duro primero: lo limpia clean_rri_ms
     rr_ms = np.diff(peaks_idx_used) / sampling_rate * 1000.0
     rr_ms = rr_ms[np.isfinite(rr_ms)]
-    rr_ms = rr_ms[(rr_ms >= 300) & (rr_ms <= 2000)]  # tolerante pero fisiológico
-    if len(rr_ms) < 20:
-        return {"error": "PPG con RR insuficientes/ruidosos. Probá apoyar mejor el dedo y reducir movimiento.", "artifact_percent": artifact_percent}
+    if len(rr_ms) < 12:
+        return {"error": "PPG con RR insuficientes/ruidosos (muy pocos intervalos).", "artifact_percent": artifact_percent}
 
-    hr_series = 60000.0 / rr_ms
-    hr_mean = float(np.nanmean(hr_series)) if len(hr_series) else np.nan
-    hr_max = float(np.nanmax(hr_series)) if len(hr_series) else np.nan
-    hr_min = float(np.nanmin(hr_series)) if len(hr_series) else np.nan
-
-    # HRV con RR directo (más estable que peaks binarios en cámara)
+    # Limpieza RR (incluye rango fisiológico y corrección)
     rr_clean, rr_art, _mask = clean_rri_ms(rr_ms)
-    # “artefactos” final: combinar cambios de fixpeaks + limpieza RR (más realista)
+
+    # artefactos final
     if np.isfinite(artifact_percent) and np.isfinite(rr_art):
         artifact_final = float(0.6 * rr_art + 0.4 * artifact_percent)
     elif np.isfinite(rr_art):
@@ -306,11 +308,28 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     else:
         artifact_final = float(artifact_percent) if np.isfinite(artifact_percent) else np.nan
 
+    # HR básicos
+    hr_series = 60000.0 / rr_clean
+    hr_mean = float(np.nanmean(hr_series)) if len(hr_series) else np.nan
+    hr_max = float(np.nanmax(hr_series)) if len(hr_series) else np.nan
+    hr_min = float(np.nanmin(hr_series)) if len(hr_series) else np.nan
+
+    # HRV: intentar rri, fallback a peaks si NeuroKit2 lo exige
+    hrv_mode = "rri"
     try:
         hrv_time = nk.hrv_time(rri=rr_clean, show=False)
         hrv_freq = nk.hrv_frequency(rri=rr_clean, show=False)
     except Exception as e:
-        return {"error": f"Fallo calculando HRV desde RR (PPG): {str(e)}", "artifact_percent": artifact_final}
+        # ✅ ESTE ES EL FIX PRINCIPAL: fallback idéntico a Polar
+        peaks_bin = rri_to_peaks(rr_clean, sampling_rate=1000)
+        if peaks_bin is None:
+            return {"error": f"Fallo calculando HRV desde RR (PPG): {str(e)}", "artifact_percent": artifact_final}
+        hrv_mode = "peaks"
+        try:
+            hrv_time = nk.hrv_time(peaks_bin, sampling_rate=1000, show=False)
+            hrv_freq = nk.hrv_frequency(peaks_bin, sampling_rate=1000, show=False)
+        except Exception as e2:
+            return {"error": f"Fallo calculando HRV desde peaks (PPG): {str(e2)}", "artifact_percent": artifact_final}
 
     def g(df, key):
         try:
@@ -329,7 +348,6 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     tp = g(hrv_freq, "HRV_TP")
     lfhf = (lf / hf) if np.isfinite(lf) and np.isfinite(hf) and hf > 0 else np.nan
 
-    # Estimación FR (conservadora)
     resp_rpm = _resp_rate_from_ppg_fft(ppg_f, sampling_rate)
 
     freq_warning = None
@@ -358,7 +376,10 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
         "hr_max": hr_max,
         "hr_min": hr_min,
         "resp_rate_rpm": resp_rpm,
-        "freq_warning": freq_warning
+        "freq_warning": freq_warning,
+        "hrv_mode": hrv_mode,
+        "n_rr": int(len(rr_clean)),
+        "n_peaks": int(len(peaks_idx_used))
     }
 
 
