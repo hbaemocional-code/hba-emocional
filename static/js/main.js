@@ -1,14 +1,7 @@
 /* static/js/main.js  (REEMPLAZAR COMPLETO)
-   ✅ FIX CRÍTICO: sin await dentro de requestAnimationFrame (evita que el JS no cargue)
-   Mantiene:
-   - fetch a /api/compute y /api/save
-   - Polar H10 BLE
-   Mejora:
-   - PPG cámara robusto: ROI 50x50 centro, canal ROJO
-   - rAF + scheduler 30fps
-   - Torch adaptativo (oscuro -> ON, saturado -> OFF) con throttle y sin bloquear
-   - Feedback de usuario + barra calidad
-   - Preprocesado antes de enviar: detrend + bandpass + winsorize + zscore
+   - Mantiene: /api/compute y /api/save; Polar BLE.
+   - FIX: Torch toggle manda (OFF = nunca se auto-prende).
+   - PPG: ROI 50x50 canal ROJO, rAF 30fps, detrend+bandpass+winsorize+zscore.
 */
 
 let selectedDurationMin = 3;
@@ -30,10 +23,11 @@ let ppgTimestamps = [];
 let targetFps = 30;
 let rafId = null;
 
-// Torch / camera controls
+// Torch
 let trackRef = null;
 let torchAvailable = false;
 let torchEnabled = false;
+let torchMode = "auto"; // "auto" | "off"
 
 // Polar H10 BLE
 let bleDevice = null;
@@ -44,9 +38,7 @@ let lastMetrics = null;
 // Chart.js
 let chart = null;
 
-/* =========================
-   UI helpers
-========================= */
+/* ========================= UI helpers ========================= */
 function setStatus(text, level="idle"){
   const dot = document.getElementById("statusDot");
   const label = document.getElementById("statusText");
@@ -78,7 +70,6 @@ function fmtTime(sec){
 function setTimerText(){
   const chipTimer = document.getElementById("chipTimer");
   if(!chipTimer) return;
-
   if(!measuring || !startedAt){
     chipTimer.textContent = "00:00";
     return;
@@ -102,9 +93,7 @@ function enableControls(){
   if(v) v.disabled = measuring || !lastMetrics || !!lastMetrics.error;
 }
 
-/* =========================
-   Calidad
-========================= */
+/* ========================= Calidad ========================= */
 function setQuality(score){
   const fill = document.getElementById("qualityFill");
   const txt = document.getElementById("qualityText");
@@ -122,9 +111,7 @@ function setQuality(score){
   else txt.textContent = "Baja";
 }
 
-/* =========================
-   Chart ECG rojo (estético)
-========================= */
+/* ========================= Chart ECG ========================= */
 const glowPlugin = {
   id: "ecgGlow",
   beforeDatasetDraw(chart){
@@ -132,8 +119,6 @@ const glowPlugin = {
     ctx.save();
     ctx.shadowColor = "rgba(255,43,43,0.45)";
     ctx.shadowBlur = 10;
-    ctx.shadowOffsetX = 0;
-    ctx.shadowOffsetY = 0;
   },
   afterDatasetDraw(chart){
     chart.ctx.restore();
@@ -178,14 +163,11 @@ function pushChartPoint(value){
   chart.update("none");
 }
 
-/* =========================
-   Setup UI
-========================= */
+/* ========================= UI setup ========================= */
 function setupDurationButtons(){
   const b3 = document.getElementById("dur3");
   const b5 = document.getElementById("dur5");
   if(!b3 || !b5) return;
-
   function setActive(min){
     selectedDurationMin = min;
     b3.classList.toggle("active", min === 3);
@@ -235,18 +217,15 @@ function buildCards(metrics){
     {k:"HR Media", v: metrics.hr_mean, u:"bpm"},
     {k:"HR Máx", v: metrics.hr_max, u:"bpm"},
     {k:"HR Mín", v: metrics.hr_min, u:"bpm"},
-
     {k:"RMSSD", v: metrics.rmssd, u:"ms"},
     {k:"SDNN", v: metrics.sdnn, u:"ms"},
     {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)"},
     {k:"pNN50", v: metrics.pnn50, u:"%"},
     {k:"Mean RR", v: metrics.mean_rr, u:"ms"},
-
     {k:"LF Power", v: metrics.lf_power, u:"ms²"},
     {k:"HF Power", v: metrics.hf_power, u:"ms²"},
     {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
     {k:"Total Power", v: metrics.total_power, u:"ms²"},
-
     {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
   ];
 
@@ -269,18 +248,45 @@ function buildCards(metrics){
   });
 }
 
-/* ==========================================================
-   Torch helpers (NO bloqueantes)
-========================================================== */
-function getTorchWanted(){
-  const el = document.getElementById("torchToggle");
-  return el ? !!el.checked : true;
-}
+/* ========================= Torch helpers ========================= */
 function setTorchLabel(text){
   const lbl = document.getElementById("torchLabel");
   if(lbl) lbl.textContent = text;
 }
+function readTorchModeFromUI(){
+  const el = document.getElementById("torchToggle");
+  torchMode = (el && el.checked) ? "auto" : "off";
+  setTorchLabel(torchMode === "auto" ? "AUTO" : "OFF");
+}
 
+function torchCapable(track){
+  try{
+    const caps = track?.getCapabilities?.();
+    return !!(caps && ("torch" in caps));
+  }catch(_e){
+    return false;
+  }
+}
+
+// throttle applyConstraints
+let torchApplyInFlight = false;
+let lastTorchApplyAt = 0;
+
+function applyTorch(on){
+  if(!trackRef || !torchAvailable) return;
+  const now = Date.now();
+  if(torchApplyInFlight) return;
+  if(now - lastTorchApplyAt < 600) return;
+  torchApplyInFlight = true;
+  lastTorchApplyAt = now;
+
+  trackRef.applyConstraints({ advanced: [{ torch: !!on }] })
+    .then(() => { torchEnabled = !!on; })
+    .catch(() => {})
+    .finally(() => { torchApplyInFlight = false; });
+}
+
+/* ========================= Camera errors ========================= */
 function explainCameraPermissionError(e){
   const name = e?.name || "";
   if(name === "NotAllowedError" || name === "PermissionDeniedError"){
@@ -295,50 +301,17 @@ function explainCameraPermissionError(e){
   return `Error cámara: ${e?.message || String(e)}`;
 }
 
-function torchCapable(track){
-  try{
-    const caps = track?.getCapabilities?.();
-    return !!(caps && ("torch" in caps));
-  }catch(_e){
-    return false;
-  }
-}
-
-// throttle constraints para no spamear el pipeline
-let lastTorchApplyAt = 0;
-let torchApplyInFlight = false;
-
-function applyTorch(track, on){
-  if(!track || !torchAvailable) return;
-  const now = Date.now();
-  if(torchApplyInFlight) return;
-  if(now - lastTorchApplyAt < 800) return;
-
-  torchApplyInFlight = true;
-  lastTorchApplyAt = now;
-
-  track.applyConstraints({ advanced: [{ torch: !!on }] })
-    .then(() => { torchEnabled = !!on; })
-    .catch(() => {})
-    .finally(() => { torchApplyInFlight = false; });
-}
-
-/* ==========================================================
-   PPG ROI 50x50 canal rojo
-========================================================== */
+/* ========================= ROI red ========================= */
 function meanRedROI(img){
   let sum = 0;
   for(let i=0; i<img.length; i+=4) sum += img[i];
   return sum / (img.length / 4);
 }
 
-/* ==========================================================
-   Preprocesado (robusto, NO “más estricto”)
-========================================================== */
+/* ========================= Preprocess ========================= */
 function detrendMovingAverage(x, fs, winSec = 1.5){
   const n = x.length;
   if(n < 20) return x.slice();
-
   const w = Math.max(5, Math.floor(fs * winSec));
   const half = Math.floor(w / 2);
 
@@ -383,7 +356,6 @@ function iirLowPass(x, fs, cutoffHz){
 function winsorize(x, zLim = 4.5){
   const n = x.length;
   if(n < 10) return x.slice();
-
   let m = 0;
   for(const v of x) m += v;
   m /= n;
@@ -409,9 +381,7 @@ function zscore(x){
   return x.map(v => (v - m) / sd);
 }
 
-/* ==========================================================
-   Cámara PPG (ARRANCA SIEMPRE) + rAF 30fps
-========================================================== */
+/* ========================= Camera PPG ========================= */
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
   frameCanvas = document.getElementById("frameCanvas");
@@ -454,7 +424,7 @@ async function startCameraPPG(){
 
   trackRef = mediaStream.getVideoTracks()[0];
 
-  // ROI exacto 50x50
+  // ROI 50x50
   const roiW = 50, roiH = 50;
   frameCanvas.width = roiW;
   frameCanvas.height = roiH;
@@ -463,39 +433,39 @@ async function startCameraPPG(){
   torchAvailable = torchCapable(trackRef);
   torchEnabled = false;
 
-  if(torchAvailable && getTorchWanted()){
-    // no await: si falla no rompe
-    applyTorch(trackRef, true);
-    setTorchLabel("AUTO");
-  } else if(torchAvailable) {
-    applyTorch(trackRef, false);
-    setTorchLabel("OFF");
+  // leer modo desde UI y aplicar inmediatamente
+  readTorchModeFromUI();
+
+  if(torchAvailable){
+    if(torchMode === "auto"){
+      applyTorch(true);
+    } else {
+      applyTorch(false);
+    }
   } else {
     setTorchLabel("N/A");
   }
 
   setStatus("Cámara activa • recolectando PPG", "ok");
 
-  // señal: baseline EWMA
+  // baseline EWMA
   let baseline = null;
   const alpha = 0.02;
 
-  // buffers de calidad (2s)
+  // quality buffers
   const winN = Math.round(2.0 * targetFps);
   const buf = [];
   let lastMeanR = null;
   let lastMsgAt = 0;
 
-  // thresholds
-  const SAT_HIGH = 250;    // flash quema
-  const DARK_LOW = 18;     // oscuro
-  const LIGHT_JUMP = 10.0; // movimiento/luz
-  const AMP_LOW = 0.0010;  // amplitud baja
+  const SAT_HIGH = 250;
+  const DARK_LOW = 18;
+  const LIGHT_JUMP = 10.0;
+  const AMP_LOW = 0.0010;
 
   let satStreak = 0;
   let darkStreak = 0;
 
-  // scheduler 30fps con rAF
   const framePeriod = 1000 / targetFps;
   let lastTick = performance.now();
   let acc = 0;
@@ -521,7 +491,6 @@ async function startCameraPPG(){
       const img = frameCtx.getImageData(0, 0, roiW, roiH).data;
       const meanR = meanRedROI(img);
 
-      // saltos de luz
       const dL = (lastMeanR == null) ? 0 : Math.abs(meanR - lastMeanR);
       lastMeanR = meanR;
 
@@ -529,7 +498,7 @@ async function startCameraPPG(){
       const tooDark = meanR <= DARK_LOW;
       const lightBad = dL >= LIGHT_JUMP;
 
-      // torch adaptativo (NO estricto: intenta mejorar en caliente)
+      // torch adaptativo SOLO si AUTO
       if(clipped){
         satStreak++;
         darkStreak = Math.max(0, darkStreak - 1);
@@ -541,33 +510,27 @@ async function startCameraPPG(){
         darkStreak = Math.max(0, darkStreak - 1);
       }
 
-      // si quema sostenido: apagar torch
-      if(satStreak >= 6){
-        satStreak = 0;
-        if(torchAvailable && torchEnabled){
-          applyTorch(trackRef, false);
-          if(Date.now() - lastMsgAt > 900){
-            lastMsgAt = Date.now();
-            setStatus("Flash quema • apagando flash automático", "warn");
+      if(torchAvailable && torchMode === "auto"){
+        if(satStreak >= 6){
+          satStreak = 0;
+          if(torchEnabled){
+            applyTorch(false);
+            if(Date.now() - lastMsgAt > 900){
+              lastMsgAt = Date.now();
+              setStatus("Flash quema • apagando flash automático", "warn");
+            }
           }
-        } else if(Date.now() - lastMsgAt > 900){
-          lastMsgAt = Date.now();
-          setStatus("Saturación • aflojá presión o reubicá dedo", "warn");
         }
-      }
 
-      // si oscuro sostenido: prender torch (solo si user permite AUTO)
-      if(darkStreak >= 6){
-        darkStreak = 0;
-        if(torchAvailable && getTorchWanted() && !torchEnabled){
-          applyTorch(trackRef, true);
-          if(Date.now() - lastMsgAt > 900){
-            lastMsgAt = Date.now();
-            setStatus("Oscuro • encendiendo flash automático", "warn");
+        if(darkStreak >= 6){
+          darkStreak = 0;
+          if(!torchEnabled){
+            applyTorch(true);
+            if(Date.now() - lastMsgAt > 900){
+              lastMsgAt = Date.now();
+              setStatus("Oscuro • encendiendo flash automático", "warn");
+            }
           }
-        } else if(Date.now() - lastMsgAt > 900){
-          lastMsgAt = Date.now();
-          setStatus(torchAvailable ? "Muy oscuro • cubrí lente+flash" : "Muy oscuro • sin flash puede fallar", "warn");
         }
       }
 
@@ -578,12 +541,10 @@ async function startCameraPPG(){
       const ac = meanR - baseline;
       const norm = (baseline !== 0) ? (ac / baseline) : 0;
 
-      // “inteligente”: si frame malo, no metemos basura, interpolamos suave
+      // frame usable
       const okFrame = (!clipped && !tooDark && !lightBad);
 
-      const ts = performance.now();
-      ppgTimestamps.push(ts);
-
+      ppgTimestamps.push(performance.now());
       if(okFrame){
         ppgSamples.push(norm);
       } else {
@@ -591,10 +552,8 @@ async function startCameraPPG(){
         ppgSamples.push(prev);
       }
 
-      // estética ECG
       pushChartPoint(ac * 60);
 
-      // calidad por amplitud ventana
       buf.push(norm);
       if(buf.length > winN) buf.shift();
 
@@ -611,7 +570,7 @@ async function startCameraPPG(){
 
         if(Date.now() - lastMsgAt > 850){
           lastMsgAt = Date.now();
-          if(clipped) setStatus("Flash quema • aflojá o desactivá flash", "warn");
+          if(clipped) setStatus("Flash quema • aflojá o apagá flash", "warn");
           else if(tooDark) setStatus(torchAvailable ? "Muy oscuro • cubrí lente+flash" : "Muy oscuro • sin flash puede fallar", "warn");
           else if(lightBad) setStatus("Movimiento/luz • mantené el dedo quieto", "warn");
           else if(p2p < AMP_LOW) setStatus("Amplitud baja • presioná un poco más firme (sin aplastar)", "warn");
@@ -633,9 +592,10 @@ async function stopCameraPPG(){
     rafId = null;
   }
 
+  // si el usuario puso OFF, respetamos igual; igual apagamos al salir
   try{
     if(trackRef && torchAvailable){
-      applyTorch(trackRef, false);
+      applyTorch(false);
     }
   }catch(_e){}
 
@@ -643,6 +603,7 @@ async function stopCameraPPG(){
     mediaStream.getTracks().forEach(t => t.stop());
     mediaStream = null;
   }
+
   trackRef = null;
   torchAvailable = false;
   torchEnabled = false;
@@ -651,9 +612,7 @@ async function stopCameraPPG(){
   setStatus("Cámara detenida", "idle");
 }
 
-/* ----------------------------
-   Polar H10 BLE (SIN CAMBIOS)
----------------------------- */
+/* ========================= Polar BLE (sin cambios) ========================= */
 function parseHeartRateMeasurement(value){
   const flags = value.getUint8(0);
   const hrValue16 = (flags & 0x01) !== 0;
@@ -732,9 +691,7 @@ async function stopPolarH10(){
   setStatus("Polar detenido", "idle");
 }
 
-/* ----------------------------
-   Medición: start/stop/compute/save
----------------------------- */
+/* ========================= Measurement ========================= */
 async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
@@ -786,7 +743,7 @@ async function stopMeasurement(){
 
   setStatus("Procesando HRV…", "warn");
 
-  let payload = {
+  const payload = {
     sensor_type: sensorType,
     duration_minutes: selectedDurationMin
   };
@@ -884,9 +841,7 @@ async function saveResult(){
   }
 }
 
-/* ----------------------------
-   Init
----------------------------- */
+/* ========================= Init ========================= */
 window.addEventListener("DOMContentLoaded", () => {
   initChart();
   setupDurationButtons();
@@ -898,12 +853,21 @@ window.addEventListener("DOMContentLoaded", () => {
   setTimerText();
   setStatus("Listo", "idle");
 
+  // Torch UI: manda en runtime
   const tt = document.getElementById("torchToggle");
   if(tt){
-    setTorchLabel(tt.checked ? "AUTO" : "OFF");
+    readTorchModeFromUI();
     tt.addEventListener("change", () => {
-      setTorchLabel(tt.checked ? "AUTO" : "OFF");
+      readTorchModeFromUI();
+      // si ya hay cámara activa, aplicar inmediatamente
+      if(trackRef && torchAvailable){
+        if(torchMode === "off") applyTorch(false);
+        else applyTorch(true);
+      }
     });
+  } else {
+    // si no existe UI, por defecto auto
+    torchMode = "auto";
   }
 
   document.getElementById("btnStart").addEventListener("click", async () => {
