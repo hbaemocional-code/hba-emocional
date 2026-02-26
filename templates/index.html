@@ -6,12 +6,19 @@
   <meta name="theme-color" content="#070a10" />
   <title>Método HBA • Monitor HRV</title>
 
+  <!-- ✅ fuerza a no usar cache en móviles (igual lo que manda es el ?v=) -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+
   <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-  <link rel="stylesheet" href="/static/css/style.css" />
+  <!-- ✅ cache-bust -->
+  <link rel="stylesheet" href="/static/css/style.css?v=20260226-1" />
 
   <!-- Chart.js (necesario para tu main.js) -->
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script defer src="/static/js/main.js"></script>
+  <!-- ✅ cache-bust -->
+  <script defer src="/static/js/main.js?v=20260226-1"></script>
 </head>
 
 <body>
@@ -128,7 +135,7 @@
               </div>
             </div>
 
-            <!-- ✅ NUEVO: Flash/Torch (no rompe nada si no existe torch) -->
+            <!-- ✅ Flash/Torch -->
             <div class="formGrid" style="margin-top:10px;">
               <div class="field">
                 <span class="fieldLabel">Flash (Torch)</span>
@@ -138,11 +145,10 @@
                   <span id="torchLabel" class="toggleLabel">AUTO</span>
                 </label>
               </div>
-
               <div class="field">
                 <span class="fieldLabel">Tip</span>
                 <div class="tinyNote">
-                  Si el flash “quema” y aplana la onda, desactivá. Si está oscuro, activá.
+                  Si el flash quema y aplana la onda, desactivá. Si está oscuro, activá.
                 </div>
               </div>
             </div>
