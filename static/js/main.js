@@ -1,12 +1,16 @@
 /* static/js/main.js  (REEMPLAZAR COMPLETO)
-   Mantiene:
-   - fetch a /api/compute y /api/save (sin cambios)
-   - Polar BLE (sin cambios de lógica)
-   Cambia SOLO “caño” de cámara PPG:
-   1) ROI 50x50 centro, canal ROJO
-   2) Feedback por amplitud y cambios bruscos de luz
-   3) 30 FPS constantes con requestAnimationFrame (scheduler fijo)
-   4) Detrending básico + normalización antes de enviar al backend
+   Objetivo: hacer PPG por cámara robusto (tipo apps que “se las bancan”)
+   SIN tocar:
+   - endpoints /api/compute y /api/save
+   - nombres de funciones de comunicación
+   - lógica Polar BLE
+
+   Cámara PPG:
+   - ROI 50x50 centro (canal rojo)
+   - 30fps estable con rAF + scheduler fijo
+   - Torch adaptativo: ON si oscuro, OFF si clipea
+   - Descarta frames malos (saltos bruscos/clipping) pero NO aborta la captura
+   - Preprocesado antes de enviar: detrend + bandpass + z-score + winsorize
 */
 
 let selectedDurationMin = 3;
@@ -25,12 +29,22 @@ let frameCtx = null;
 let ppgSamples = [];
 let ppgTimestamps = [];
 
+// buffers “crudos” para limpieza inteligente
+let rawR = [];            // meanR por frame (0-255)
+let rawNorm = [];         // señal normalizada (ac/baseline) por frame
+let rawOkMask = [];       // boolean: frame usable o no
+
 let targetFps = 30;
 let rafId = null;
 
-// Torch
+// Torch / camera controls
+let trackRef = null;
 let torchAvailable = false;
 let torchEnabled = false;
+let exposureCompAvailable = false;
+let exposureCompMin = 0;
+let exposureCompMax = 0;
+let exposureCompCurrent = null;
 
 // Polar H10 BLE
 let bleDevice = null;
@@ -111,13 +125,14 @@ function setQuality(score){
   }
   const s = Math.max(0, Math.min(100, score));
   fill.style.width = `${s.toFixed(0)}%`;
+
   if(s >= 70) txt.textContent = "Alta";
   else if(s >= 40) txt.textContent = "Media";
   else txt.textContent = "Baja";
 }
 
 /* =========================
-   Chart ECG (estético)
+   Chart ECG rojo (estético)
 ========================= */
 const glowPlugin = {
   id: "ecgGlow",
@@ -126,6 +141,8 @@ const glowPlugin = {
     ctx.save();
     ctx.shadowColor = "rgba(255,43,43,0.45)";
     ctx.shadowBlur = 10;
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
   },
   afterDatasetDraw(chart){
     chart.ctx.restore();
@@ -133,17 +150,20 @@ const glowPlugin = {
 };
 
 function initChart(){
-  const ctx = document.getElementById("signalChart");
-  chart = new Chart(ctx, {
+  const el = document.getElementById("signalChart");
+  chart = new Chart(el, {
     type: "line",
-    data: { labels: [], datasets: [{
-      label: "Señal",
-      data: [],
-      pointRadius: 0,
-      borderWidth: 3,
-      tension: 0.18,
-      borderColor: "#ff2b2b"
-    }]},
+    data: {
+      labels: [],
+      datasets: [{
+        label: "Señal",
+        data: [],
+        pointRadius: 0,
+        borderWidth: 3,
+        tension: 0.18,
+        borderColor: "#ff2b2b"
+      }]
+    },
     options: {
       responsive: true,
       maintainAspectRatio: false,
@@ -201,12 +221,14 @@ function buildCards(metrics){
     return;
   }
 
-  if(metrics.freq_warning) freqHint.textContent = metrics.freq_warning;
+  if(metrics.freq_warning){
+    freqHint.textContent = metrics.freq_warning;
+  }
 
   if(metrics.error){
     const c = document.createElement("div");
     c.className = "card bad";
-    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / dedo / luz</div>`;
+    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Señal insuficiente/saturada o backend sin picos</div>`;
     cards.appendChild(c);
     return;
   }
@@ -247,20 +269,31 @@ function buildCards(metrics){
 }
 
 /* ==========================================================
-   Cámara helpers: permisos / torch
+   Cámara: permisos / torch / exposure
 ========================================================== */
 function explainCameraPermissionError(e){
   const name = e?.name || "";
   if(name === "NotAllowedError" || name === "PermissionDeniedError"){
-    return "Permiso de cámara denegado. Tocá el candado (🔒) en Chrome → Permitir Cámara, y recargá.";
+    return "Permiso de cámara denegado. Candado (🔒) → Permitir Cámara → recargar.";
   }
   if(name === "NotReadableError" || name === "TrackStartError"){
-    return "La cámara está ocupada o bloqueada. Cerrá otras apps que usen cámara y reintentá.";
+    return "Cámara ocupada/bloqueada. Cerrá otras apps que usen cámara y reintentá.";
   }
   if(name === "NotFoundError"){
     return "No se encontró cámara en este dispositivo.";
   }
   return `Error cámara: ${e?.message || String(e)}`;
+}
+
+function getTorchWanted(){
+  const el = document.getElementById("torchToggle");
+  // AUTO: si existe y está chequeado
+  return el ? !!el.checked : true;
+}
+
+function setTorchLabel(text){
+  const lbl = document.getElementById("torchLabel");
+  if(lbl) lbl.textContent = text;
 }
 
 async function enableTorch(track, on){
@@ -275,30 +308,135 @@ async function enableTorch(track, on){
   }
 }
 
-function getTorchWanted(){
-  const t = document.getElementById("torchToggle");
-  return t ? !!t.checked : true; // default auto ON
+function initExposureCaps(track){
+  exposureCompAvailable = false;
+  exposureCompMin = 0;
+  exposureCompMax = 0;
+  exposureCompCurrent = null;
+
+  try{
+    const caps = track.getCapabilities?.();
+    if(caps?.exposureCompensation){
+      exposureCompAvailable = true;
+      exposureCompMin = caps.exposureCompensation.min;
+      exposureCompMax = caps.exposureCompensation.max;
+
+      const st = track.getSettings?.();
+      if(typeof st?.exposureCompensation === "number"){
+        exposureCompCurrent = st.exposureCompensation;
+      } else {
+        exposureCompCurrent = 0;
+      }
+    }
+  }catch(_e){}
 }
 
-function setTorchLabel(text){
-  const lbl = document.getElementById("torchLabel");
-  if(lbl) lbl.textContent = text;
+async function setExposureComp(track, value){
+  if(!exposureCompAvailable) return false;
+  const v = Math.min(exposureCompMax, Math.max(exposureCompMin, value));
+  try{
+    await track.applyConstraints({ advanced: [{ exposureCompensation: v }] });
+    exposureCompCurrent = v;
+    return true;
+  }catch(_e){
+    return false;
+  }
 }
 
 /* ==========================================================
-   CÁMARA PPG REGLAS:
-   1) ROI 50x50 centro, canal ROJO
-   2) Feedback por amplitud y cambios bruscos de luz
-   3) 30 FPS estables con requestAnimationFrame (scheduler fijo)
-   4) Detrending antes de enviar
+   PPG ROI 50x50 (rojo)
 ========================================================== */
 function meanRedROI(img){
-  // img = Uint8ClampedArray RGBA 50x50
   let sum = 0;
   for(let i=0; i<img.length; i+=4) sum += img[i];
   return sum / (img.length / 4);
 }
 
+/* ==========================================================
+   Preprocesado inteligente (NO “más estricto”)
+   - detrend MA
+   - bandpass IIR simple (0.7–4Hz aprox)
+   - winsorize (recorta outliers sin romper señal)
+   - zscore
+========================================================== */
+function detrendMovingAverage(x, fs, winSec = 1.5){
+  const n = x.length;
+  if(n < 20) return x.slice();
+
+  const w = Math.max(5, Math.floor(fs * winSec));
+  const half = Math.floor(w / 2);
+
+  const pref = new Array(n + 1);
+  pref[0] = 0;
+  for(let i=0;i<n;i++) pref[i+1] = pref[i] + x[i];
+
+  const y = new Array(n);
+  for(let i=0;i<n;i++){
+    const a = Math.max(0, i - half);
+    const b = Math.min(n - 1, i + half);
+    const mean = (pref[b+1] - pref[a]) / (b - a + 1);
+    y[i] = x[i] - mean;
+  }
+  return y;
+}
+
+function iirHighPass(x, fs, cutoffHz){
+  const dt = 1 / fs;
+  const rc = 1 / (2 * Math.PI * cutoffHz);
+  const alpha = rc / (rc + dt);
+  const y = new Array(x.length);
+  y[0] = 0;
+  for(let i=1;i<x.length;i++){
+    y[i] = alpha * (y[i-1] + x[i] - x[i-1]);
+  }
+  return y;
+}
+
+function iirLowPass(x, fs, cutoffHz){
+  const dt = 1 / fs;
+  const rc = 1 / (2 * Math.PI * cutoffHz);
+  const alpha = dt / (rc + dt);
+  const y = new Array(x.length);
+  y[0] = x[0];
+  for(let i=1;i<x.length;i++){
+    y[i] = y[i-1] + alpha * (x[i] - y[i-1]);
+  }
+  return y;
+}
+
+function winsorize(x, zLim = 4.5){
+  // recorta valores extremos tras zscore preliminar
+  const n = x.length;
+  if(n < 10) return x.slice();
+
+  // mean/std
+  let m = 0;
+  for(const v of x) m += v;
+  m /= n;
+  let v2 = 0;
+  for(const v of x) v2 += (v - m) * (v - m);
+  const sd = Math.sqrt(v2 / n) || 1e-6;
+
+  const lo = m - zLim * sd;
+  const hi = m + zLim * sd;
+  return x.map(v => Math.min(hi, Math.max(lo, v)));
+}
+
+function zscore(x){
+  const n = x.length;
+  if(n < 2) return x.slice();
+  let m = 0;
+  for(const v of x) m += v;
+  m /= n;
+  let v2 = 0;
+  for(const v of x) v2 += (v - m) * (v - m);
+  const sd = Math.sqrt(v2 / n) || 1e-6;
+  return x.map(v => (v - m) / sd);
+}
+
+/* ==========================================================
+   Captura Cámara PPG: “menos estricto + más inteligente”
+========================================================== */
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
   frameCanvas = document.getElementById("frameCanvas");
@@ -306,8 +444,12 @@ async function startCameraPPG(){
 
   frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
 
+  // reset buffers
   ppgSamples = [];
   ppgTimestamps = [];
+  rawR = [];
+  rawNorm = [];
+  rawOkMask = [];
   setQuality(null);
 
   setStatus("Solicitando permiso de cámara…", "warn");
@@ -331,65 +473,73 @@ async function startCameraPPG(){
   videoEl.muted = true;
   try { await videoEl.play(); } catch(_e) {}
 
-  // esperar frames
+  // esperar metadata frames
   const t0 = Date.now();
   while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
     await new Promise(r => setTimeout(r, 50));
   }
   if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-    throw new Error("Cámara autorizada pero sin frames. Recargá y revisá permisos.");
+    throw new Error("Cámara autorizada pero sin frames. Revisá permisos y recargá.");
   }
 
-  const track = mediaStream.getVideoTracks()[0];
+  trackRef = mediaStream.getVideoTracks()[0];
 
-  // ROI EXACTO 50x50
+  // ROI 50x50
   const roiW = 50, roiH = 50;
   frameCanvas.width = roiW;
   frameCanvas.height = roiH;
 
-  // Torch
+  // torch capability
   torchAvailable = false;
   torchEnabled = false;
-  if(track?.getCapabilities){
-    const caps = track.getCapabilities();
+  try{
+    const caps = trackRef.getCapabilities?.();
     torchAvailable = !!(caps && ("torch" in caps));
-  }
+  }catch(_e){}
 
+  // exposure comp
+  initExposureCaps(trackRef);
+
+  // Torch “AUTO”: arrancar ON si el user lo pide (pero luego adaptamos)
   const wantTorch = getTorchWanted();
   if(torchAvailable && wantTorch){
-    torchEnabled = await enableTorch(track, true);
-    setTorchLabel(torchEnabled ? "ON" : "Bloq.");
+    torchEnabled = await enableTorch(trackRef, true);
+    setTorchLabel(torchEnabled ? "AUTO" : "BLOQ");
   } else if(torchAvailable && !wantTorch){
-    torchEnabled = await enableTorch(track, false);
+    torchEnabled = await enableTorch(trackRef, false);
     setTorchLabel("OFF");
   } else {
     setTorchLabel("N/A");
   }
 
-  setStatus(torchEnabled ? "Cámara activa • Flash ON • PPG (ROJO)" : "Cámara activa • PPG (ROJO)", torchEnabled ? "ok" : "warn");
+  setStatus("Cámara activa • recolectando PPG (ROI 50×50 ROJO)", "ok");
 
-  // Señal: trabajamos con el nivel de rojo y sacamos AC
+  // AC extraction (baseline EWMA)
   let baseline = null;
   const alpha = 0.02;
 
-  // Buffers para feedback de usuario (últimos ~2s)
-  const ampWindowSec = 2.0;
+  // calidad/feedback buffers (~2s)
+  const winSec = 2.0;
+  const winN = Math.round(winSec * 30);
   const ampBuf = [];
-  const lightBuf = [];
+  const dLightBuf = [];
+  let lastMeanR = null;
 
-  // Scheduler 30fps fijo con rAF
+  // thresholds (no rígidos: sólo guían)
+  const SAT_HIGH = 250;     // clipeo
+  const DARK_LOW = 18;      // muy oscuro
+  const LIGHT_JUMP = 10.0;  // salto brusco (movimiento/luz)
+  const AMP_LOW = 0.0010;   // amplitud baja -> apretar más (moderado)
+
+  // scheduler 30fps fijo con rAF (estable)
   const framePeriod = 1000 / 30;
   let lastTick = performance.now();
   let acc = 0;
-
-  // thresholds (ajustados a finger+flash)
-  const AMP_LOW = 0.0012;   // amplitud muy chica -> “presioná más firmeza”
-  const LIGHT_JUMP = 7.0;   // salto en meanR (0-255) -> “quieto”
-  const SAT_HIGH = 245;     // saturación por flash
-  const DARK_LOW = 20;      // muy oscuro
-
-  let lastMeanR = null;
   let lastMsgAt = 0;
+
+  // control adaptativo torch/exposure
+  let satStreak = 0;
+  let darkStreak = 0;
 
   const loop = (now) => {
     if(!measuring) return;
@@ -397,8 +547,7 @@ async function startCameraPPG(){
     acc += (now - lastTick);
     lastTick = now;
 
-    // procesar a 30fps “cuasi-constantes”
-    // (si hay backlog, procesamos máx 2 frames para no quemar CPU)
+    // procesar como reloj a 30fps; máx 2 steps para no quemar CPU
     let steps = 0;
     while(acc >= framePeriod && steps < 2){
       acc -= framePeriod;
@@ -407,7 +556,7 @@ async function startCameraPPG(){
       const vw = videoEl.videoWidth;
       const vh = videoEl.videoHeight;
 
-      // ROI centro del video (50x50). Dibujamos SOLO esa región al canvas 50x50.
+      // ROI centro exacto
       const sx = (vw / 2) - (roiW / 2);
       const sy = (vh / 2) - (roiH / 2);
 
@@ -415,77 +564,148 @@ async function startCameraPPG(){
       const img = frameCtx.getImageData(0, 0, roiW, roiH).data;
       const meanR = meanRedROI(img);
 
-      // feedback por luz (saltos bruscos)
+      rawR.push(meanR);
+
+      // dLight (movimiento/luz)
       if(lastMeanR != null){
         const dL = Math.abs(meanR - lastMeanR);
-        lightBuf.push(dL);
-        if(lightBuf.length > Math.round(ampWindowSec * 30)) lightBuf.shift();
+        dLightBuf.push(dL);
+        if(dLightBuf.length > winN) dLightBuf.shift();
       }
       lastMeanR = meanR;
 
-      // Si está quemando u oscuro, avisar y NO acumular basura
-      if(meanR >= SAT_HIGH){
-        setQuality(10);
-        if(now - lastMsgAt > 900){
-          lastMsgAt = now;
-          setStatus("Flash quema la señal • desactivá Flash o aflojá presión", "warn");
-        }
-        continue;
-      }
-      if(meanR <= DARK_LOW){
-        setQuality(5);
-        if(now - lastMsgAt > 900){
-          lastMsgAt = now;
-          setStatus(torchAvailable ? "Muy oscuro • el dedo no cubre lente+flash" : "Muy oscuro • sin flash PPG suele fallar", "warn");
-        }
-        continue;
+      // flags frame
+      const clipped = meanR >= SAT_HIGH;
+      const tooDark = meanR <= DARK_LOW;
+
+      // Torch/exposure adaptativo (inteligente, no “todo o nada”)
+      if(clipped){
+        satStreak++;
+        darkStreak = Math.max(0, darkStreak - 1);
+      } else if(tooDark){
+        darkStreak++;
+        satStreak = Math.max(0, satStreak - 1);
+      } else {
+        satStreak = Math.max(0, satStreak - 1);
+        darkStreak = Math.max(0, darkStreak - 1);
       }
 
-      // AC extraction (quita deriva lenta)
+      // si satura sostenido -> bajar exposición o apagar torch
+      if(satStreak >= 6){
+        satStreak = 0;
+
+        // intentar bajar exposureComp primero
+        if(exposureCompAvailable && exposureCompCurrent != null){
+          const ok = await setExposureComp(trackRef, exposureCompCurrent - 1);
+          if(ok && now - lastMsgAt > 900){
+            lastMsgAt = now;
+            setStatus("Saturación detectada • bajando exposición automáticamente", "warn");
+          }
+        } else if(torchAvailable && torchEnabled){
+          // apagar torch si está “quemando”
+          const ok = await enableTorch(trackRef, false);
+          torchEnabled = ok ? false : torchEnabled;
+          if(ok){
+            if(now - lastMsgAt > 900){
+              lastMsgAt = now;
+              setStatus("Flash quemaba • apagando flash automáticamente", "warn");
+            }
+          }
+        } else {
+          if(now - lastMsgAt > 900){
+            lastMsgAt = now;
+            setStatus("Señal saturada • aflojá presión o reubicá el dedo", "warn");
+          }
+        }
+      }
+
+      // si está oscuro sostenido -> subir exposición o prender torch
+      if(darkStreak >= 6){
+        darkStreak = 0;
+
+        if(exposureCompAvailable && exposureCompCurrent != null){
+          const ok = await setExposureComp(trackRef, exposureCompCurrent + 1);
+          if(ok && now - lastMsgAt > 900){
+            lastMsgAt = now;
+            setStatus("Muy oscuro • subiendo exposición automáticamente", "warn");
+          }
+        } else if(torchAvailable && getTorchWanted() && !torchEnabled){
+          const ok = await enableTorch(trackRef, true);
+          torchEnabled = ok ? true : torchEnabled;
+          if(ok && now - lastMsgAt > 900){
+            lastMsgAt = now;
+            setStatus("Muy oscuro • encendiendo flash automáticamente", "warn");
+          }
+        } else {
+          if(now - lastMsgAt > 900){
+            lastMsgAt = now;
+            setStatus(torchAvailable ? "Muy oscuro • cubrí bien lente+flash" : "Muy oscuro • sin flash puede fallar", "warn");
+          }
+        }
+      }
+
+      // baseline / señal
       if(baseline === null) baseline = meanR;
       baseline = (1 - alpha) * baseline + alpha * meanR;
 
       const ac = meanR - baseline;
-      const normalized = (baseline !== 0) ? (ac / baseline) : 0;
+      const norm = (baseline !== 0) ? (ac / baseline) : 0;
 
-      // guardado crudo (normalizado “semi-plano”)
-      ppgSamples.push(normalized);
-      ppgTimestamps.push(performance.now());
+      rawNorm.push(norm);
 
-      // estética ECG (amplificación visual)
+      // heurística “menos estricta”:
+      // marco frame como “usable” salvo clipping fuerte o salto de luz gigante
+      const lightMax = dLightBuf.length ? Math.max(...dLightBuf) : 0;
+      const lightBad = lightMax > LIGHT_JUMP;
+
+      const okFrame = (!clipped && !tooDark && !lightBad);
+      rawOkMask.push(okFrame);
+
+      // guardamos SIEMPRE timestamps (para fs), pero sólo acumulamos al vector final si el frame es ok,
+      // y si no es ok, lo “suavizamos” (queda continuidad sin meter basura fuerte).
+      const nowTs = performance.now();
+      ppgTimestamps.push(nowTs);
+
+      if(okFrame){
+        ppgSamples.push(norm);
+      } else {
+        // fallback: si el frame es malo, metemos un valor interpolado suave (último bueno)
+        const prev = ppgSamples.length ? ppgSamples[ppgSamples.length - 1] : 0;
+        ppgSamples.push(prev);
+      }
+
+      // visual ECG: no importa si es “perfecto”, es estético
       pushChartPoint(ac * 60);
 
-      // amplitud (peak-to-peak) sobre ventana
-      ampBuf.push(normalized);
-      const maxLen = Math.round(ampWindowSec * 30);
-      if(ampBuf.length > maxLen) ampBuf.shift();
+      // calidad + feedback
+      ampBuf.push(norm);
+      if(ampBuf.length > winN) ampBuf.shift();
 
       if(ampBuf.length >= Math.round(1.2 * 30)){
         let mn = Infinity, mx = -Infinity;
         for(const v of ampBuf){ if(v < mn) mn = v; if(v > mx) mx = v; }
         const p2p = mx - mn;
 
-        // detectar cambios bruscos de luz
-        const lightMax = lightBuf.length ? Math.max(...lightBuf) : 0;
-        const lightBad = lightMax > LIGHT_JUMP;
-
-        // score simple: amplitud buena y luz estable
+        // score combina amplitud + estabilidad (no castiga demasiado)
         let score = 0;
-        score += Math.min(70, (p2p / (AMP_LOW * 6)) * 70); // escala por amplitud
-        if(!lightBad) score += 30;
+        score += Math.min(70, (p2p / (AMP_LOW * 6)) * 70);
+        score += okFrame ? 30 : 10;
         score = Math.max(0, Math.min(100, score));
         setQuality(score);
 
-        // feedback textual (prioridades)
         if(now - lastMsgAt > 850){
           lastMsgAt = now;
 
-          if(lightBad){
-            setStatus("Cambios de luz detectados • mantené el dedo quieto", "warn");
+          if(clipped){
+            setStatus("Flash quema la señal • aflojá presión o apagá flash", "warn");
+          } else if(tooDark){
+            setStatus(torchAvailable ? "Muy oscuro • cubrí lente+flash" : "Muy oscuro • sin flash puede fallar", "warn");
+          } else if(lightBad){
+            setStatus("Movimiento/luz inestable • mantené el dedo quieto", "warn");
           } else if(p2p < AMP_LOW){
-            setStatus("Amplitud baja • presioná el dedo con más firmeza (sin aplastar)", "warn");
+            setStatus("Amplitud baja • presioná un poco más firme (sin aplastar)", "warn");
           } else if(score >= 70){
-            setStatus(torchEnabled ? "Señal alta • excelente (Flash ON)" : "Señal alta • excelente", "ok");
+            setStatus(torchEnabled ? "Señal alta • excelente (flash adaptativo)" : "Señal alta • excelente", "ok");
           } else {
             setStatus("Señal media • mantené estable", "ok");
           }
@@ -507,9 +727,8 @@ async function stopCameraPPG(){
 
   // apagar torch
   try{
-    const track = mediaStream?.getVideoTracks?.()[0];
-    if(track && torchAvailable){
-      await enableTorch(track, false);
+    if(trackRef && torchAvailable){
+      await enableTorch(trackRef, false);
     }
   }catch(_e){}
 
@@ -517,7 +736,7 @@ async function stopCameraPPG(){
     mediaStream.getTracks().forEach(t => t.stop());
     mediaStream = null;
   }
-
+  trackRef = null;
   torchAvailable = false;
   torchEnabled = false;
 
@@ -525,56 +744,19 @@ async function stopCameraPPG(){
   setStatus("Cámara detenida", "idle");
 }
 
-/* ==========================
-   Detrending (JS) antes de enviar
-   - Sustrae media móvil (high-pass básico)
-   - Normaliza z-score (mejor para NeuroKit2)
-========================== */
-function detrendMovingAverage(x, fs, winSec = 1.5){
-  const n = x.length;
-  if(n < 10) return x.slice();
-
-  const w = Math.max(3, Math.floor(fs * winSec));
-  const half = Math.floor(w / 2);
-
-  // prefix sums para media móvil eficiente
-  const pref = new Array(n + 1);
-  pref[0] = 0;
-  for(let i=0;i<n;i++) pref[i+1] = pref[i] + x[i];
-
-  const y = new Array(n);
-  for(let i=0;i<n;i++){
-    const a = Math.max(0, i - half);
-    const b = Math.min(n - 1, i + half);
-    const mean = (pref[b+1] - pref[a]) / (b - a + 1);
-    y[i] = x[i] - mean;
-  }
-  return y;
-}
-
-function zscore(x){
-  const n = x.length;
-  if(n < 2) return x.slice();
-  let m = 0;
-  for(const v of x) m += v;
-  m /= n;
-  let v2 = 0;
-  for(const v of x) v2 += (v - m) * (v - m);
-  const sd = Math.sqrt(v2 / n) || 1e-6;
-  return x.map(v => (v - m) / sd);
-}
-
-/* ----------------------------
+/* ==========================================================
    Polar H10 BLE (SIN CAMBIOS)
----------------------------- */
+========================================================== */
 function parseHeartRateMeasurement(value){
   const flags = value.getUint8(0);
   const hrValue16 = (flags & 0x01) !== 0;
   const rrPresent = (flags & 0x10) !== 0;
 
   let index = 1;
+
   if(hrValue16) index += 2;
   else index += 1;
+
   if((flags & 0x08) !== 0) index += 2;
 
   const rrs = [];
@@ -643,10 +825,9 @@ async function stopPolarH10(){
   setStatus("Polar detenido", "idle");
 }
 
-/* ----------------------------
+/* ==========================================================
    Medición: start/stop/compute/save
-   (ENDPOINTS SIN CAMBIOS)
----------------------------- */
+========================================================== */
 async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
@@ -702,7 +883,7 @@ async function stopMeasurement(){
   };
 
   if(sensorType === "camera_ppg"){
-    // fs estimado real por timestamps
+    // fs real desde timestamps
     let fs = targetFps;
     if(ppgTimestamps.length > 10){
       const diffs = [];
@@ -713,8 +894,15 @@ async function stopMeasurement(){
       if(meanDt > 0) fs = 1.0 / meanDt;
     }
 
-    // ✅ detrend + zscore antes de enviar a NeuroKit2
+    // limpieza “inteligente” (no estricta):
+    // 1) detrend MA
     let cleaned = detrendMovingAverage(ppgSamples, fs, 1.5);
+    // 2) bandpass simple: HP 0.7Hz, LP 4Hz (pulso típico 42–240 bpm)
+    cleaned = iirHighPass(cleaned, fs, 0.7);
+    cleaned = iirLowPass(cleaned, fs, 4.0);
+    // 3) winsorize (recorta outliers)
+    cleaned = winsorize(cleaned, 4.5);
+    // 4) zscore
     cleaned = zscore(cleaned);
 
     payload.ppg = cleaned;
@@ -729,6 +917,7 @@ async function stopMeasurement(){
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
+
     const metrics = await res.json();
     lastMetrics = metrics;
 
@@ -793,9 +982,9 @@ async function saveResult(){
   }
 }
 
-/* ----------------------------
+/* =========================
    Init
----------------------------- */
+========================= */
 window.addEventListener("DOMContentLoaded", () => {
   initChart();
   setupDurationButtons();
@@ -807,12 +996,12 @@ window.addEventListener("DOMContentLoaded", () => {
   setTimerText();
   setStatus("Listo", "idle");
 
-  // toggle torch label init
-  const t = document.getElementById("torchToggle");
-  if(t){
-    setTorchLabel(t.checked ? "Auto" : "OFF");
-    t.addEventListener("change", () => {
-      setTorchLabel(t.checked ? "Auto" : "OFF");
+  // init torch label
+  const tt = document.getElementById("torchToggle");
+  if(tt){
+    setTorchLabel(tt.checked ? "AUTO" : "OFF");
+    tt.addEventListener("change", () => {
+      setTorchLabel(tt.checked ? "AUTO" : "OFF");
     });
   }
 
