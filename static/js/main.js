@@ -1,3 +1,5 @@
+/* static/js/main.js  (REEMPLAZAR COMPLETO) */
+
 let selectedDurationMin = 3;
 let measuring = false;
 let sensorType = "camera_ppg";
@@ -13,7 +15,9 @@ let frameCtx = null;
 
 let ppgSamples = [];
 let ppgTimestamps = [];
-let targetFps = 45;
+
+// CPU/Temperatura (no torch, menos resolución y fps moderado)
+let targetFps = 28;
 let cameraLoopHandle = null;
 
 // Polar H10 BLE
@@ -24,11 +28,6 @@ let lastMetrics = null;
 
 // Chart.js
 let chart = null;
-
-// Calidad señal (frontend)
-let qualityScore = 0; // 0..100
-let qualityWindow = []; // últimos N samples (para estimar)
-let qualityLastUpdate = 0;
 
 function setStatus(text, level="idle"){
   const dot = document.getElementById("statusDot");
@@ -43,7 +42,7 @@ function setStatus(text, level="idle"){
     dot.style.boxShadow = "0 0 0 4px rgba(251,191,36,0.16)";
   } else if(level === "bad"){
     dot.style.background = "var(--bad)";
-    dot.style.boxShadow = "0 0 0 4px rgba(255,43,43,0.18)";
+    dot.style.boxShadow = "0 0 0 4px rgba(251,113,133,0.16)";
   } else {
     dot.style.background = "var(--muted)";
     dot.style.boxShadow = "0 0 0 4px rgba(149,163,183,0.12)";
@@ -77,18 +76,40 @@ function enableControls(){
   document.getElementById("btnSave").disabled = measuring || !lastMetrics || !!lastMetrics.error;
 }
 
-/* Glow rojo para Chart.js (sin cambiar IDs) */
+/* =========================
+   Calidad (solo informa)
+========================= */
+function setQuality(score){
+  const fill = document.getElementById("qualityFill");
+  const txt = document.getElementById("qualityText");
+  if(!fill || !txt) return;
+
+  if(score == null || !Number.isFinite(score)){
+    fill.style.width = "0%";
+    txt.textContent = "—";
+    return;
+  }
+  const s = Math.max(0, Math.min(100, score));
+  fill.style.width = `${s.toFixed(0)}%`;
+  if(s >= 70) txt.textContent = "Alta";
+  else if(s >= 40) txt.textContent = "Media";
+  else txt.textContent = "Baja";
+}
+
+/* =========================
+   Chart ECG rojo (estético)
+========================= */
 const glowPlugin = {
-  id: "glowPlugin",
-  beforeDatasetsDraw(chart, args, pluginOptions){
-    const { ctx } = chart;
+  id: "ecgGlow",
+  beforeDatasetDraw(chart){
+    const ctx = chart.ctx;
     ctx.save();
-    ctx.shadowColor = "rgba(255, 43, 43, 0.55)";
-    ctx.shadowBlur = 14;
+    ctx.shadowColor = "rgba(255,43,43,0.45)";
+    ctx.shadowBlur = 10;
     ctx.shadowOffsetX = 0;
     ctx.shadowOffsetY = 0;
   },
-  afterDatasetsDraw(chart){
+  afterDatasetDraw(chart){
     chart.ctx.restore();
   }
 };
@@ -100,7 +121,7 @@ function initChart(){
     data: {
       labels: [],
       datasets: [{
-        label: "ECG",
+        label: "Señal",
         data: [],
         pointRadius: 0,
         borderWidth: 3,
@@ -113,14 +134,7 @@ function initChart(){
       maintainAspectRatio: false,
       animation: false,
       plugins: { legend: { display: false } },
-      scales: {
-        x: { display: false },
-        y: {
-          display: false,
-          suggestedMin: -2,
-          suggestedMax: 2
-        }
-      }
+      scales: { x: { display: false }, y: { display: false } }
     },
     plugins: [glowPlugin]
   });
@@ -158,26 +172,6 @@ function setupSensorSelector(){
   });
 }
 
-/* Barra de calidad (sin cambiar IDs existentes) */
-function setQuality(score, text){
-  const fill = document.getElementById("qualityFill");
-  const label = document.getElementById("qualityLabel");
-  const hint = document.getElementById("qualityHint");
-
-  const s = Math.max(0, Math.min(100, Math.round(score)));
-  fill.style.width = `${s}%`;
-
-  label.textContent = text || `${s}%`;
-
-  if(s >= 75){
-    hint.textContent = "Señal buena. Mantené el dedo firme.";
-  } else if(s >= 45){
-    hint.textContent = "Señal media. Presioná un poco más y evitá mover el dedo.";
-  } else {
-    hint.textContent = "Señal baja. Tapá completamente el lente + flash/linterna y evitá movimiento.";
-  }
-}
-
 function buildCards(metrics){
   const cards = document.getElementById("cards");
   const freqHint = document.getElementById("freqHint");
@@ -199,32 +193,34 @@ function buildCards(metrics){
   if(metrics.error){
     const c = document.createElement("div");
     c.className = "card bad";
-    c.innerHTML = `<div class="k">ERROR</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / movimiento</div>`;
+    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / movimiento</div>`;
     cards.appendChild(c);
     return;
   }
 
   const items = [
-    {k:"HR (Media)", v: metrics.hr_mean, u:"bpm"},
-    {k:"HR (Máx)", v: metrics.hr_max, u:"bpm"},
-    {k:"HR (Mín)", v: metrics.hr_min, u:"bpm"},
+    {k:"HR Media", v: metrics.hr_mean, u:"bpm"},
+    {k:"HR Máx", v: metrics.hr_max, u:"bpm"},
+    {k:"HR Mín", v: metrics.hr_min, u:"bpm"},
+
     {k:"RMSSD", v: metrics.rmssd, u:"ms"},
     {k:"SDNN", v: metrics.sdnn, u:"ms"},
     {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)"},
     {k:"pNN50", v: metrics.pnn50, u:"%"},
     {k:"Mean RR", v: metrics.mean_rr, u:"ms"},
+
     {k:"LF Power", v: metrics.lf_power, u:"ms²"},
     {k:"HF Power", v: metrics.hf_power, u:"ms²"},
     {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
     {k:"Total Power", v: metrics.total_power, u:"ms²"},
-    {k:"Resp (est.)", v: metrics.resp_rate_rpm, u:"rpm"},
+
     {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
   ];
 
   items.forEach(it => {
     const num = typeof it.v === "number" ? it.v : Number(it.v);
     const isNum = Number.isFinite(num);
-    const val = isNum ? (it.k.includes("LF/HF") ? num.toFixed(2) : num.toFixed(1)) : "—";
+    const val = isNum ? num.toFixed(it.k.startsWith("HR") ? 0 : 3) : "—";
 
     let cls = "card";
     if(it.k === "Artefactos" && isNum){
@@ -240,9 +236,92 @@ function buildCards(metrics){
   });
 }
 
-// ----------------------------
-// Cámara PPG (tolerante + calidad realtime)
-// ----------------------------
+/* ==========================================================
+   CÁMARA: BLOQUEO AUTOFOCUS + AUTOEXPOSURE (best-effort)
+   - Si el dispositivo lo soporta: pone foco MANUAL cerca
+   - Bloquea exposición/whitebalance para evitar “bombeo”
+   - Si NO lo soporta: no rompe, sigue igual
+========================================================== */
+async function applyCameraLocks(track){
+  if(!track) return;
+
+  const caps = track.getCapabilities ? track.getCapabilities() : null;
+  const settings = track.getSettings ? track.getSettings() : null;
+
+  const adv = [];
+
+  // 1) Foco
+  // Preferimos: manual y foco cerca (finger on lens).
+  if(caps && caps.focusMode){
+    const modes = Array.isArray(caps.focusMode) ? caps.focusMode : [];
+    if(modes.includes("manual")){
+      adv.push({ focusMode: "manual" });
+      if(caps.focusDistance){
+        const min = caps.focusDistance.min ?? 0;
+        // cerca = mínimo
+        adv.push({ focusDistance: min });
+      }
+    } else if(modes.includes("continuous")){
+      // fallback
+      adv.push({ focusMode: "continuous" });
+    }
+  }
+
+  // 2) Exposición
+  if(caps && caps.exposureMode){
+    const modes = Array.isArray(caps.exposureMode) ? caps.exposureMode : [];
+    if(modes.includes("manual")){
+      adv.push({ exposureMode: "manual" });
+
+      // copiar valores actuales si existen (bloqueo estable)
+      if(settings && typeof settings.exposureTime === "number" && caps.exposureTime){
+        const v = Math.min(caps.exposureTime.max, Math.max(caps.exposureTime.min, settings.exposureTime));
+        adv.push({ exposureTime: v });
+      }
+      if(settings && typeof settings.iso === "number" && caps.iso){
+        const v = Math.min(caps.iso.max, Math.max(caps.iso.min, settings.iso));
+        adv.push({ iso: v });
+      }
+    } else if(modes.includes("continuous")){
+      adv.push({ exposureMode: "continuous" });
+    }
+  }
+
+  // 3) Compensación exposición (si hay) — dejamos en el valor actual o 0
+  if(caps && caps.exposureCompensation){
+    const cur = (settings && typeof settings.exposureCompensation === "number") ? settings.exposureCompensation : 0;
+    const v = Math.min(caps.exposureCompensation.max, Math.max(caps.exposureCompensation.min, cur));
+    adv.push({ exposureCompensation: v });
+  }
+
+  // 4) White balance (bloquea bombeo de color)
+  if(caps && caps.whiteBalanceMode){
+    const modes = Array.isArray(caps.whiteBalanceMode) ? caps.whiteBalanceMode : [];
+    if(modes.includes("manual")){
+      adv.push({ whiteBalanceMode: "manual" });
+      if(settings && typeof settings.colorTemperature === "number" && caps.colorTemperature){
+        const v = Math.min(caps.colorTemperature.max, Math.max(caps.colorTemperature.min, settings.colorTemperature));
+        adv.push({ colorTemperature: v });
+      }
+    }
+  }
+
+  // aplicar si hay algo
+  if(adv.length){
+    try{
+      await track.applyConstraints({ advanced: adv });
+    }catch(_e){
+      // NO romper
+    }
+  }
+}
+
+/* ==========================
+   Cámara PPG (robusta + fría)
+   - usa canal VERDE
+   - NO torch (evita calor)
+   - locks autofocus/exposure cuando se puede
+========================== */
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
   frameCanvas = document.getElementById("frameCanvas");
@@ -250,16 +329,14 @@ async function startCameraPPG(){
 
   ppgSamples = [];
   ppgTimestamps = [];
-  qualityWindow = [];
-  qualityScore = 0;
-  setQuality(0, "—");
+  setQuality(null);
 
   mediaStream = await navigator.mediaDevices.getUserMedia({
     video: {
       facingMode: "environment",
-      frameRate: { ideal: 60, min: 24 },
-      width: { ideal: 1280 },
-      height: { ideal: 720 }
+      frameRate: { ideal: 30, min: 15 },
+      width: { ideal: 640 },
+      height: { ideal: 480 }
     },
     audio: false
   });
@@ -267,43 +344,36 @@ async function startCameraPPG(){
   videoEl.srcObject = mediaStream;
   videoEl.playsInline = true;
   videoEl.muted = true;
-
   try { await videoEl.play(); } catch(_e) {}
 
-  // esperar frames reales
   const t0 = Date.now();
   while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
     await new Promise(r => setTimeout(r, 50));
   }
   if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-    throw new Error("Cámara autorizada pero sin frames (revisá permisos / Chrome real).");
+    throw new Error("Cámara autorizada pero sin frames. Revisá permisos en Chrome.");
   }
 
-  // torch si existe
-  let torchOn = false;
   const track = mediaStream.getVideoTracks()[0];
-  try{
-    const caps = track.getCapabilities?.();
-    if (caps && caps.torch) {
-      await track.applyConstraints({ advanced: [{ torch: true }] });
-      torchOn = true;
-    }
-  }catch(_e){}
 
-  const w = 160, h = 120;
+  // ✅ Lock AF/AE/WB (si el teléfono lo soporta)
+  await applyCameraLocks(track);
+
+  // Canvas chico para bajar calor
+  const w = 96, h = 72;
   frameCanvas.width = w;
   frameCanvas.height = h;
 
-  setStatus(torchOn ? "Cámara trasera + torch ON • recolectando PPG" : "Cámara trasera • recolectando PPG", torchOn ? "ok" : "warn");
+  setStatus("Cámara activa • recolectando PPG", "ok");
 
   const intervalMs = Math.round(1000 / targetFps);
 
-  // extracción robusta:
-  // - meanR
-  // - AC = meanR - runningMean
-  // - normalizado: AC/DC
   let runningMean = null;
-  let runningVar = 0;
+
+  const qbuf = [];
+  const qmax = Math.round(5 * targetFps);
+  let lastQualityTick = 0;
+  let lowStreak = 0;
 
   cameraLoopHandle = setInterval(() => {
     if(!measuring) return;
@@ -311,77 +381,59 @@ async function startCameraPPG(){
     frameCtx.drawImage(videoEl, 0, 0, w, h);
     const img = frameCtx.getImageData(0, 0, w, h).data;
 
-    let sumR = 0;
-    for(let i=0; i<img.length; i+=4) sumR += img[i];
-    const meanR = sumR / (img.length / 4);
+    // Canal VERDE
+    let sumG = 0;
+    for(let i=0; i<img.length; i+=4) sumG += img[i+1];
+    const meanG = sumG / (img.length / 4);
 
-    if (runningMean === null) runningMean = meanR;
-    runningMean = 0.97 * runningMean + 0.03 * meanR;
+    if (runningMean === null) runningMean = meanG;
+    runningMean = 0.98 * runningMean + 0.02 * meanG;
 
-    const ac = meanR - runningMean;
-    const norm = (runningMean !== 0) ? (ac / runningMean) : 0;
+    const ac = meanG - runningMean;
+    const normalized = (runningMean !== 0) ? (ac / runningMean) : 0;
 
-    // suavizado simple para curva fluida
-    const last = ppgSamples.length ? ppgSamples[ppgSamples.length-1] : 0;
-    const sm = 0.75 * last + 0.25 * norm;
+    // Visual ECG (solo estética)
+    pushChartPoint(ac * 40);
 
-    ppgSamples.push(sm);
+    ppgSamples.push(normalized);
     ppgTimestamps.push(performance.now());
 
-    // curva ECG-like (centrada y amplificada)
-    pushChartPoint(sm * 120);
+    // Calidad (no punitivo)
+    qbuf.push(normalized);
+    if(qbuf.length > qmax) qbuf.shift();
 
-    // calidad (cada ~250ms)
-    qualityWindow.push(sm);
-    const maxW = Math.max(120, Math.round(targetFps * 6)); // 6s aprox
-    if(qualityWindow.length > maxW) qualityWindow.shift();
+    const now = Date.now();
+    if(qbuf.length > Math.round(2 * targetFps) && (now - lastQualityTick) > 350){
+      lastQualityTick = now;
 
-    const now = performance.now();
-    if(now - qualityLastUpdate > 250){
-      qualityLastUpdate = now;
+      const m = qbuf.reduce((a,b)=>a+b,0) / qbuf.length;
+      let varx = 0;
+      for(const v of qbuf) varx += (v - m) * (v - m);
+      const stdx = Math.sqrt(varx / qbuf.length);
 
-      // métricas rápidas: var + “actividad pulsátil”
-      const n = qualityWindow.length;
-      if(n > Math.round(targetFps * 2)){
-        let m = 0;
-        for(let i=0;i<n;i++) m += qualityWindow[i];
-        m /= n;
+      let vard = 0;
+      for(let i=1;i<qbuf.length;i++){
+        const d = qbuf[i] - qbuf[i-1];
+        vard += d*d;
+      }
+      const stdd = Math.sqrt(vard / Math.max(1, qbuf.length-1));
 
-        let v = 0;
-        for(let i=0;i<n;i++){
-          const d = qualityWindow[i] - m;
-          v += d*d;
-        }
-        v /= n;
+      const raw = stdx / (stdd + 1e-6);
+      const score = Math.max(0, Math.min(100, raw * 55));
+      setQuality(score);
 
-        runningVar = 0.85 * runningVar + 0.15 * v;
-
-        // score: var moderada (no cero, no caos)
-        const varScore = Math.max(0, Math.min(1, (runningVar - 1e-6) / (2.5e-4))); // calibrado empírico
-        // penalizar saturación / oscuridad
-        const lightPenalty = (meanR < 8) ? 0.35 : 1.0;
-
-        // penalizar movimiento brusco (saltos)
-        let jumps = 0;
-        for(let i=1;i<n;i++){
-          if(Math.abs(qualityWindow[i]-qualityWindow[i-1]) > 0.05) jumps++;
-        }
-        const jumpRate = jumps / Math.max(n-1,1);
-        const motionPenalty = 1.0 - Math.max(0, Math.min(0.55, jumpRate * 2.2));
-
-        const raw = 100 * varScore * lightPenalty * motionPenalty;
-        qualityScore = 0.7 * qualityScore + 0.3 * raw;
-
-        let label = `${Math.round(qualityScore)}%`;
-        if(qualityScore >= 75) label = "BUENA";
-        else if(qualityScore >= 45) label = "MEDIA";
-        else label = "BAJA";
-
-        setQuality(qualityScore, label);
+      if(score < 25){
+        lowStreak++;
+        if(lowStreak >= 4) setStatus("Señal baja • tapá bien el lente y apretá estable", "warn");
+      } else if(score < 55){
+        lowStreak = Math.max(0, lowStreak - 1);
+        setStatus("Señal media • mantené estable", "ok");
       } else {
-        setQuality(0, "—");
+        lowStreak = 0;
+        setStatus("Señal alta • excelente", "ok");
       }
     }
+
   }, intervalMs);
 }
 
@@ -391,13 +443,10 @@ function stopCameraPPG(){
     cameraLoopHandle = null;
   }
   if(mediaStream){
-    const tracks = mediaStream.getVideoTracks();
-    tracks.forEach(t => {
-      try { t.applyConstraints({ advanced: [{ torch: false }] }); } catch(_e) {}
-      t.stop();
-    });
+    mediaStream.getTracks().forEach(t => t.stop());
     mediaStream = null;
   }
+  setQuality(null);
   setStatus("Cámara detenida", "idle");
 }
 
@@ -457,8 +506,7 @@ async function connectPolarH10(){
     if(rrs.length){
       rrs.forEach(rr => {
         rrIntervalsMs.push(rr);
-        // curva tipo ECG también: mapear RR a variación visual suave
-        pushChartPoint((60_000 / rr - 60) * 2.0);
+        pushChartPoint(rr);
       });
     }
   });
@@ -490,18 +538,11 @@ async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
 
-  // bloquear ANT+ (no implementado acá)
-  if(sensorType === "ant_group"){
-    setStatus("ANT+ Grupo: próximamente", "warn");
-    return;
-  }
-
   measuring = true;
   startedAt = Date.now();
   enableControls();
   setSensorChip();
 
-  // Reset chart
   chart.data.labels = [];
   chart.data.datasets[0].data = [];
   chart.update("none");
@@ -643,7 +684,7 @@ window.addEventListener("DOMContentLoaded", () => {
   setSensorChip();
   enableControls();
   buildCards(null);
-  setQuality(0, "—");
+  setQuality(null);
 
   document.getElementById("btnStart").addEventListener("click", async () => {
     if(measuring) return;
