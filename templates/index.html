@@ -13,12 +13,11 @@
   <header class="topbar">
     <div class="brand">
       <div class="brand-logo">
-        <!-- poné tu logo en /static/img/hba_logo.png -->
         <img src="/static/img/hba_logo.png" alt="HBA" onerror="this.style.display='none';" />
       </div>
       <div>
         <div class="brand-title">HBA Emocional</div>
-        <div class="brand-subtitle">Plataforma de Monitoreo Autonómico • Rehabilitación</div>
+        <div class="brand-subtitle">Recolección de HRV • Fase 1 (Datos)</div>
       </div>
     </div>
 
@@ -30,7 +29,7 @@
 
   <main class="container">
     <section class="panel">
-      <h2>Registro</h2>
+      <h2>Configuración de Registro</h2>
 
       <div class="grid-2">
         <div class="field">
@@ -61,10 +60,10 @@
         <div class="field">
           <label>Duración</label>
           <div class="segmented">
-            <button class="seg-btn active" data-min="3" id="dur3">3 min</button>
-            <button class="seg-btn" data-min="5" id="dur5">5 min</button>
+            <button class="seg-btn active" data-min="3" id="dur3">3 minutos</button>
+            <button class="seg-btn" data-min="5" id="dur5">5 minutos</button>
           </div>
-          <div class="hint">5 min recomendado para espectral (LF/HF) más estable.</div>
+          <div class="hint" id="freqHint">5 min recomendado para espectral (LF/HF) más estable.</div>
         </div>
       </div>
 
@@ -76,50 +75,41 @@
 
       <div class="note">
         <label>Notas (opcional)</label>
-        <input id="notes" type="text" placeholder="Ej: descanso previo, medicación, observaciones..." />
+        <input id="notes" type="text" placeholder="Ej: descanso 2 min previo, medicación, etc." />
       </div>
     </section>
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Señal</h2>
+        <h2>Señal en Tiempo Real</h2>
         <div class="mini">
           <span class="chip" id="chipSensor">Sensor: Cámara (PPG)</span>
           <span class="chip chip-strong" id="chipTimer">00:00</span>
+          <span class="chip chip-quality" id="chipQuality">Calidad: —</span>
         </div>
       </div>
 
-      <div class="chart-wrap">
+      <div class="chart-wrap ecg">
         <canvas id="signalChart"></canvas>
       </div>
 
       <video id="video" playsinline autoplay muted class="hidden"></video>
       <canvas id="frameCanvas" class="hidden"></canvas>
+
+      <div class="hint" id="qualityHint">Indicador de calidad en vivo para evitar fallos al final.</div>
     </section>
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Resultados</h2>
-        <div class="hint" id="freqHint"></div>
+        <h2>Data Details</h2>
       </div>
 
       <div class="cards" id="cards"></div>
-
-      <div class="divider"></div>
-
-      <div class="panel-head">
-        <h2>Evolución del Alumno</h2>
-        <div class="hint">Se carga si existen mediciones guardadas en CSV.</div>
-      </div>
-
-      <div class="chart-wrap small">
-        <canvas id="trendChart"></canvas>
-      </div>
     </section>
   </main>
 
   <footer class="footer">
-    <div>© Método HBA • HBA Emocional</div>
+    <div>© HBA Emocional • Fase 1</div>
     <div class="footer-hint">Uso científico / rehabilitación. No diagnóstico.</div>
   </footer>
 
