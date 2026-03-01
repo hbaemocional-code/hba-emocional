@@ -39,20 +39,9 @@
         </div>
       </div>
 
-      <div class="grid-2">
-        <div class="field">
-          <label>Sexo</label>
-          <select id="sex">
-            <option value="M">M</option>
-            <option value="F">F</option>
-            <option value="X" selected>X</option>
-          </select>
-          <div class="hint">Se usa para referencia RMSSD por edad/sexo (orientativo).</div>
-        </div>
-        <div class="field">
-          <label>Comorbilidades</label>
-          <input id="comorbidities" type="text" placeholder="Ej: HTA, DM2, EPOC" />
-        </div>
+      <div class="field">
+        <label>Comorbilidades</label>
+        <input id="comorbidities" type="text" placeholder="Ej: HTA, DM2, EPOC" />
       </div>
 
       <div class="grid-2">
@@ -76,9 +65,6 @@
           <div class="hint">5 min recomendado para espectral (LF/HF) más estable.</div>
         </div>
       </div>
-
-      <!-- Si tu CSS/HTML ya tiene torchToggle/quality, no lo toco.
-           Si no existen, estas refs simplemente no harán nada en JS. -->
 
       <div class="actions">
         <button class="btn primary" id="btnStart">Iniciar Medición</button>
@@ -117,111 +103,33 @@
 
       <div class="cards" id="cards"></div>
 
-      <!-- ========================= -->
-      <!-- CUADRO 1: Biomarcadores -->
-      <!-- ========================= -->
-      <div class="panel-head" style="margin-top:18px;">
+      <!-- ===================================================== -->
+      <!-- DASHBOARD HBA (mismo sistema de "cards", sin tablas)  -->
+      <!-- ===================================================== -->
+
+      <div class="panel-head" style="margin-top:16px;">
         <h2>Cuadro de Biomarcadores</h2>
-        <div class="hint">Valor + estado (alto/medio/bajo) + carga autonómica, estrés y fatigas.</div>
+        <div class="hint">Biomarcador + estado (alto/medio/bajo) + lectura práctica.</div>
       </div>
+      <div class="cards" id="bioCards"></div>
 
-      <div class="cards">
-        <div class="card">
-          <table style="width:100%; border-collapse:collapse;">
-            <thead>
-              <tr>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Biomarcador</th>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Valor</th>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Estado</th>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Nota</th>
-              </tr>
-            </thead>
-            <tbody id="bioTableBody"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- ========================= -->
-      <!-- CUADRO 2: Significados -->
-      <!-- ========================= -->
-      <div class="panel-head" style="margin-top:18px;">
+      <div class="panel-head" style="margin-top:16px;">
         <h2>¿Qué significa cada biomarcador?</h2>
-        <div class="hint">Explicación práctica (no diagnóstico).</div>
+        <div class="hint">Guía práctica (no diagnóstico).</div>
       </div>
+      <div class="cards" id="meaningCards"></div>
 
-      <div class="cards">
-        <div class="card">
-          <table style="width:100%; border-collapse:collapse;">
-            <thead>
-              <tr>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Biomarcador</th>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Significado</th>
-              </tr>
-            </thead>
-            <tbody id="meaningTableBody"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <!-- ========================= -->
-      <!-- CUADRO 3: RMSSD por edad -->
-      <!-- ========================= -->
-      <div class="panel-head" style="margin-top:18px;">
+      <div class="panel-head" style="margin-top:16px;">
         <h2>RMSSD por edad</h2>
-        <div class="hint">Bajo / Normal / Alto (orientativo). Se usa para el semáforo.</div>
+        <div class="hint">Bajo / Normal / Alto (orientativo). Base del semáforo.</div>
       </div>
+      <div class="cards" id="normsCards"></div>
 
-      <div class="cards">
-        <div class="card">
-          <table style="width:100%; border-collapse:collapse;">
-            <thead>
-              <tr>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Edad</th>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Bajo</th>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Normal</th>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Alto</th>
-                <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Tu estado</th>
-              </tr>
-            </thead>
-            <tbody id="normsTableBody"></tbody>
-          </table>
-        </div>
+      <div class="panel-head" style="margin-top:16px;">
+        <h2>Semáforo HBA</h2>
+        <div class="hint">Tu diferenciador: plan porcentual según carga autonómica (RMSSD).</div>
       </div>
-
-      <!-- ========================= -->
-      <!-- SEMÁFORO HBA -->
-      <!-- ========================= -->
-      <div class="panel-head" style="margin-top:18px;">
-        <h2>Semáforo HBA (diferenciador)</h2>
-        <div class="hint">Plan porcentual según carga (RMSSD por edad/sexo).</div>
-      </div>
-
-      <div class="cards">
-        <div class="card" id="semaforoBox" style="border:2px solid rgba(255,255,255,0.15);">
-          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-            <div>
-              <div style="opacity:.8; font-size:12px;">Color</div>
-              <div id="semaforoColor" style="font-weight:700; font-size:18px;">-</div>
-            </div>
-            <div style="opacity:.9; font-size:12px; max-width:520px;">
-              <span id="differentiatorText"></span>
-            </div>
-          </div>
-
-          <div style="margin-top:12px;">
-            <table style="width:100%; border-collapse:collapse;">
-              <thead>
-                <tr>
-                  <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">Intervención</th>
-                  <th style="text-align:left; padding:8px; border-bottom:1px solid rgba(255,255,255,0.08);">%</th>
-                </tr>
-              </thead>
-              <tbody id="semaforoPlanBody"></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-
+      <div class="cards" id="semaforoCards"></div>
     </section>
   </main>
 
@@ -230,6 +138,7 @@
     <div class="footer-hint">Uso científico / rehabilitación. No diagnóstico.</div>
   </footer>
 
-  <script src="/static/js/main.js"></script>
+  <!-- Si tenés cache agresivo, subí a v=2 -->
+  <script src="/static/js/main.js?v=2"></script>
 </body>
 </html>
