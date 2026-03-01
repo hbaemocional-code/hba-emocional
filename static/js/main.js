@@ -1,10 +1,14 @@
-/* static/js/main.js (REEMPLAZAR COMPLETO)
+/* static/js/main.js  (REEMPLAZAR COMPLETO)
    Mantiene:
    - /api/compute y /api/save
    - Polar BLE
-   - PPG PRO (AC-only + ROI + torch auto + calidad)
-   Agrega:
-   - Render del Dashboard HBA usando tu CSS (dashGrid, dashTile, cards, card good/warn/bad)
+   - Cámara PPG (AC-only + rAF scheduler)
+   Agrega (SIN ROMPER UI):
+   - Dashboard tiles
+   - Cuadro de Biomarcadores (alto/medio/bajo)
+   - Significados
+   - Normas por edad
+   - Semáforo HBA (tu diferenciador)
 */
 
 let selectedDurationMin = 3;
@@ -114,7 +118,7 @@ function setQuality(score){
   else txt.textContent = "Baja";
 }
 
-/* ========================= Chart ========================= */
+/* ========================= Chart ECG ========================= */
 const glowPlugin = {
   id: "ecgGlow",
   beforeDatasetDraw(chart){
@@ -129,12 +133,15 @@ const glowPlugin = {
 };
 
 function initChart(){
-  const ctx = document.getElementById("signalChart");
-  chart = new Chart(ctx, {
+  const canvas = document.getElementById("signalChart");
+  if(!canvas) return;
+
+  chart = new Chart(canvas, {
     type: "line",
     data: {
       labels: [],
       datasets: [{
+        label: "Señal",
         data: [],
         pointRadius: 0,
         borderWidth: 3,
@@ -190,101 +197,8 @@ function setupSensorSelector(){
   });
 }
 
-/* ========================= Dashboard HBA render ========================= */
-function clsFromState(state){
-  const s = (state || "").toLowerCase();
-  if(s === "alto") return "good";
-  if(s === "medio") return "warn";
-  if(s === "bajo") return "bad";
-  return "";
-}
-
-function fmtNum(v, decimals=2){
-  const n = (typeof v === "number") ? v : Number(v);
-  return Number.isFinite(n) ? n.toFixed(decimals) : "—";
-}
-
-function clearDash(){
-  const dashGrid = document.getElementById("dashGrid");
-  const cards = document.getElementById("cards");
-  const meaning = document.getElementById("meaningCards");
-  const norms = document.getElementById("normsCards");
-  const sem = document.getElementById("semaforoCards");
-
-  if(dashGrid) dashGrid.innerHTML = "";
-  if(cards) cards.innerHTML = `<div class="hint">Aún no hay métricas calculadas..</div>`;
-  if(meaning) meaning.innerHTML = "";
-  if(norms) norms.innerHTML = "";
-  if(sem) sem.innerHTML = "";
-}
-
-function buildDashTiles(metrics){
-  const dashGrid = document.getElementById("dashGrid");
-  if(!dashGrid) return;
-  dashGrid.innerHTML = "";
-
-  if(!metrics || metrics.error){
-    const h = document.createElement("div");
-    h.className = "hint";
-    h.textContent = "Aún no hay métricas calculadas..";
-    dashGrid.appendChild(h);
-    return;
-  }
-
-  const hba = metrics.hba_dashboard;
-  if(!hba){
-    const h = document.createElement("div");
-    h.className = "hint";
-    h.textContent = "No hay dashboard HBA en la respuesta del backend.";
-    dashGrid.appendChild(h);
-    return;
-  }
-
-  // buscar biomarcadores clave
-  const bm = Array.isArray(hba.biomarkers) ? hba.biomarkers : [];
-  const pick = (name) => bm.find(x => (x.name || "").toLowerCase() === name.toLowerCase());
-
-  const rm = pick("HRV (RMSSD)");
-  const si = pick("Índice de estrés Baevsky");
-  const sc = pick("Score autonómico");
-  const st = pick("Estrés");
-  const fp = pick("Fatiga física");
-  const fe = pick("Fatiga emocional");
-
-  const tiles = [
-    { title: "HRV (RMSSD)", badge: rm?.state, main: `${fmtNum(rm?.value, 1)} ms`, a: "Estado", av: (rm?.state || "—"), b: "Ref", bv: (rm?.detail || "—"), c: "Modo", cv: (metrics.hrv_mode || "—") },
-    { title: "Carga autonómica", badge: sc?.state, main: `${fmtNum(sc?.value, 0)}/100`, a: "Estrés", av: (st?.state || "—"), b: "Baevsky", bv: fmtNum(si?.value, 0), c: "LF/HF", cv: fmtNum(metrics.lf_hf, 2) },
-    { title: "Fatiga", badge: (fp?.state || fe?.state), main: "Física / Emocional", a: "Física", av: `${fmtNum(fp?.value, 0)}/100`, b: "Emocional", bv: `${fmtNum(fe?.value, 0)}/100`, c: "FC media", cv: `${fmtNum(metrics.hr_mean, 0)} bpm` },
-  ];
-
-  tiles.forEach(t => {
-    const badgeState = (t.badge || "").toLowerCase();
-    const badgeCls = badgeState === "alto" ? "warn" : (badgeState === "bajo" ? "ok" : "warn");
-    // Nota: tu CSS tiene .tileBadge.ok y .tileBadge.warn (no hay bad), usamos ok/warn.
-    const badgeText = (t.badge || "—").toUpperCase();
-
-    const el = document.createElement("div");
-    el.className = "dashTile glass neon";
-
-    el.innerHTML = `
-      <div class="tileTop">
-        <div class="tileName">${t.title}</div>
-        <div class="tileBadge ${badgeCls}">${badgeText}</div>
-      </div>
-
-      <div class="tileMid">
-        <div class="miniStat"><span>${t.a}</span><strong>${t.av}</strong></div>
-        <div class="miniStat"><span>${t.b}</span><strong>${t.bv}</strong></div>
-        <div class="miniStat"><span>${t.c}</span><strong>${t.cv}</strong></div>
-      </div>
-
-      <div class="tileBar"><span class="tileBarFill"></span></div>
-    `;
-    dashGrid.appendChild(el);
-  });
-}
-
-function buildBiomarkerCards(metrics){
+/* ========================= Cards: métricas base ========================= */
+function buildCards(metrics){
   const cards = document.getElementById("cards");
   const freqHint = document.getElementById("freqHint");
   if(!cards || !freqHint) return;
@@ -293,7 +207,10 @@ function buildBiomarkerCards(metrics){
   freqHint.textContent = "";
 
   if(!metrics){
-    cards.innerHTML = `<div class="hint">Aún no hay métricas calculadas..</div>`;
+    const empty = document.createElement("div");
+    empty.className = "hint";
+    empty.textContent = "Aún no hay métricas calculadas.";
+    cards.appendChild(empty);
     return;
   }
 
@@ -307,159 +224,237 @@ function buildBiomarkerCards(metrics){
     return;
   }
 
-  const hba = metrics.hba_dashboard;
-  if(!hba || !Array.isArray(hba.biomarkers)){
-    // fallback: mostrar tus métricas clásicas si no viene HBA
-    const items = [
-      {k:"HR Media", v: metrics.hr_mean, u:"bpm"},
-      {k:"HR Máx", v: metrics.hr_max, u:"bpm"},
-      {k:"HR Mín", v: metrics.hr_min, u:"bpm"},
-      {k:"RMSSD", v: metrics.rmssd, u:"ms"},
-      {k:"SDNN", v: metrics.sdnn, u:"ms"},
-      {k:"lnRMSSD", v: metrics.lnrmssd, u:"ln(ms)"},
-      {k:"pNN50", v: metrics.pnn50, u:"%"},
-      {k:"Mean RR", v: metrics.mean_rr, u:"ms"},
-      {k:"LF Power", v: metrics.lf_power, u:"ms²"},
-      {k:"HF Power", v: metrics.hf_power, u:"ms²"},
-      {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
-      {k:"Total Power", v: metrics.total_power, u:"ms²"},
-      {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
-    ];
+  const items = [
+    {k:"HR Media", v: metrics.hr_mean, u:"bpm"},
+    {k:"HR Máx", v: metrics.hr_max, u:"bpm"},
+    {k:"HR Mín", v: metrics.hr_min, u:"bpm"},
+    {k:"HRV (RMSSD)", v: metrics.rmssd, u:"ms"},
+    {k:"SDNN", v: metrics.sdnn, u:"ms"},
+    {k:"lnRMSSD", v: metrics.lnrmssd, u:""},
+    {k:"pNN50", v: metrics.pnn50, u:"%"},
+    {k:"Mean RR", v: metrics.mean_rr, u:"ms"},
+    {k:"LF Power", v: metrics.lf_power, u:"ms²"},
+    {k:"HF Power", v: metrics.hf_power, u:"ms²"},
+    {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
+    {k:"Total Power", v: metrics.total_power, u:"ms²"},
+    {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
+    {k:"Resp (estim.)", v: metrics.resp_rate_rpm, u:"rpm"},
+  ];
 
-    items.forEach(it => {
-      const num = typeof it.v === "number" ? it.v : Number(it.v);
-      const isNum = Number.isFinite(num);
-      const val = isNum ? num.toFixed(it.k.startsWith("HR") ? 0 : 2) : "—";
+  items.forEach(it => {
+    const num = typeof it.v === "number" ? it.v : Number(it.v);
+    const isNum = Number.isFinite(num);
+    const val =
+      !isNum ? "—" :
+      (it.k.startsWith("HR ") ? num.toFixed(0) :
+      (it.k === "Artefactos" ? num.toFixed(1) :
+      (it.k === "Resp (estim.)" ? num.toFixed(1) : num.toFixed(3))));
 
-      let cls = "card";
-      if(it.k === "Artefactos" && isNum){
-        if(num <= 8) cls += " good";
-        else if(num <= 18) cls += " warn";
-        else cls += " bad";
-      }
-      const c = document.createElement("div");
-      c.className = cls;
-      c.innerHTML = `<div class="k">${it.k}</div><div class="v">${val}</div><div class="u">${it.u}</div>`;
-      cards.appendChild(c);
-    });
+    let cls = "card";
+    if(it.k === "Artefactos" && isNum){
+      if(num <= 8) cls += " good";
+      else if(num <= 18) cls += " warn";
+      else cls += " bad";
+    }
 
-    return;
-  }
-
-  // HBA cards
-  hba.biomarkers.forEach(b => {
-    const cls = clsFromState(b.state);
     const c = document.createElement("div");
-    c.className = `card ${cls}`.trim();
-
-    const unit = b.unit || "";
-    const v = (typeof b.value === "number" || Number.isFinite(Number(b.value)))
-      ? (unit === "bpm" ? fmtNum(b.value, 0) : fmtNum(b.value, 2))
-      : "—";
-
-    const stateText = b.state ? `Estado: ${String(b.state).toUpperCase()}` : "Estado: —";
-    const detail = b.detail ? ` • ${b.detail}` : "";
-
-    c.innerHTML = `
-      <div class="k">${b.name}</div>
-      <div class="v">${v}${unit ? " " + unit : ""}</div>
-      <div class="u">${stateText}${detail}</div>
-    `;
+    c.className = cls;
+    c.innerHTML = `<div class="k">${it.k}</div><div class="v">${val}</div><div class="u">${it.u}</div>`;
     cards.appendChild(c);
   });
 }
 
-function buildMeaningCards(metrics){
+/* ========================= HBA Dashboard (NUEVO) ========================= */
+function _stateToCardClass(state){
+  const s = String(state || "").toLowerCase();
+  if(s === "alto" || s === "ok" || s === "verde") return "good";
+  if(s === "medio" || s === "amarillo" || s === "warn") return "warn";
+  if(s === "bajo" || s === "rojo" || s === "bad") return "bad";
+  return "";
+}
+
+function _fmtValue(v){
+  const num = (typeof v === "number") ? v : Number(v);
+  if(!Number.isFinite(num)) return "—";
+  return num.toFixed(2);
+}
+
+function buildDashTiles(metrics){
+  const grid = document.getElementById("dashGrid");
+  if(!grid) return;
+  grid.innerHTML = "";
+
+  if(!metrics || metrics.error){
+    const h = document.createElement("div");
+    h.className = "hint";
+    h.textContent = "Aún no hay métricas calculadas.";
+    grid.appendChild(h);
+    return;
+  }
+
+  const dash = metrics.hba_dashboard;
+  const rm = dash?.norms?.rmssd_state || "—";
+  const sem = dash?.semaphore?.color || "gris";
+  const art = Number(metrics.artifact_percent);
+
+  const hr = Number(metrics.hr_mean);
+  const rmssd = Number(metrics.rmssd);
+
+  const tile = document.createElement("div");
+  tile.className = "dashTile glass neon";
+  tile.innerHTML = `
+    <div class="tileTop">
+      <div class="tileName">Paciente</div>
+      <div class="tileBadge ${art<=8 ? "ok" : (art<=18 ? "warn" : "warn")}" style="${art>18 ? "border-color: rgba(251,113,133,0.22); box-shadow: 0 0 18px rgba(251,113,133,0.10);" : ""}">
+        ${metrics.error ? "Error" : "Listo"}
+      </div>
+    </div>
+
+    <div class="tileMid">
+      <div class="miniStat"><span>HR</span><strong>${Number.isFinite(hr) ? hr.toFixed(0) : "—"}</strong></div>
+      <div class="miniStat"><span>RMSSD</span><strong>${Number.isFinite(rmssd) ? rmssd.toFixed(0) : "—"}</strong></div>
+      <div class="miniStat"><span>Artef.</span><strong>${Number.isFinite(art) ? art.toFixed(0) : "—"}</strong></div>
+    </div>
+
+    <div class="miniStat" style="margin-top:2px;">
+      <span>Semáforo</span>
+      <strong style="text-transform:uppercase">${String(sem)}</strong>
+    </div>
+
+    <div class="miniStat">
+      <span>HRV estado (edad)</span>
+      <strong style="text-transform:uppercase">${String(rm)}</strong>
+    </div>
+
+    <div class="tileBar"><span class="tileBarFill" style="width:${Number.isFinite(art)? Math.max(5, Math.min(100, 100-art)) : 35}%;"></span></div>
+  `;
+  grid.appendChild(tile);
+}
+
+function buildHBADashboard(metrics){
+  const bio = document.getElementById("bioCards");
   const meaning = document.getElementById("meaningCards");
-  if(!meaning) return;
-  meaning.innerHTML = "";
-
-  const hba = metrics?.hba_dashboard;
-  const arr = Array.isArray(hba?.interpretation) ? hba.interpretation : [];
-
-  if(!arr.length){
-    meaning.innerHTML = `<div class="hint">Sin datos de interpretación.</div>`;
-    return;
-  }
-
-  arr.forEach(x => {
-    const c = document.createElement("div");
-    c.className = "card";
-    c.innerHTML = `<div class="k">${x.biomarker || "Biomarcador"}</div><div class="v">—</div><div class="u">${x.meaning || ""}</div>`;
-    meaning.appendChild(c);
-  });
-}
-
-function buildNormsCards(metrics){
   const norms = document.getElementById("normsCards");
-  if(!norms) return;
-  norms.innerHTML = "";
+  const sema = document.getElementById("semaforoCards");
 
-  const hba = metrics?.hba_dashboard;
-  const n = hba?.norms;
-  if(!n){
-    norms.innerHTML = `<div class="hint">Sin datos de normas por edad.</div>`;
+  if(bio) bio.innerHTML = "";
+  if(meaning) meaning.innerHTML = "";
+  if(norms) norms.innerHTML = "";
+  if(sema) sema.innerHTML = "";
+
+  if(!metrics || metrics.error){
+    if(bio){
+      const h = document.createElement("div");
+      h.className = "hint";
+      h.textContent = "Aún no hay biomarcadores.";
+      bio.appendChild(h);
+    }
     return;
   }
 
-  const cls = clsFromState(n.rmssd_state);
-  const c = document.createElement("div");
-  c.className = `card ${cls}`.trim();
-
-  c.innerHTML = `
-    <div class="k">Referencia RMSSD</div>
-    <div class="v">${fmtNum(n.rmssd_low,0)}–${fmtNum(n.rmssd_high,0)} ms</div>
-    <div class="u">Edad: ${n.age ?? "—"} • Sexo: ${n.sex ?? "—"} • Estado: ${(n.rmssd_state || "—").toUpperCase()}</div>
-  `;
-  norms.appendChild(c);
-}
-
-function buildSemaforoCards(metrics){
-  const sem = document.getElementById("semaforoCards");
-  if(!sem) return;
-  sem.innerHTML = "";
-
-  const hba = metrics?.hba_dashboard;
-  const s = hba?.semaphore;
-  if(!s){
-    sem.innerHTML = `<div class="hint">Sin datos de semáforo.</div>`;
+  const dash = metrics.hba_dashboard;
+  if(!dash){
+    if(bio){
+      const h = document.createElement("div");
+      h.className = "hint";
+      h.textContent = "Dashboard HBA no disponible (backend no lo devolvió).";
+      bio.appendChild(h);
+    }
     return;
   }
 
-  const color = (s.color || "gris").toLowerCase();
-  let cls = "";
-  if(color === "verde") cls = "good";
-  else if(color === "amarillo") cls = "warn";
-  else if(color === "rojo") cls = "bad";
+  // 1) Biomarcadores: card con biomarcador + valor + estado + detalle
+  const list = Array.isArray(dash.biomarkers) ? dash.biomarkers : [];
+  if(bio){
+    if(!list.length){
+      const h = document.createElement("div");
+      h.className = "hint";
+      h.textContent = "No hay biomarcadores para mostrar.";
+      bio.appendChild(h);
+    } else {
+      list.forEach(bm => {
+        const cls = _stateToCardClass(bm.state);
+        const c = document.createElement("div");
+        c.className = `card ${cls}`;
+        const val = _fmtValue(bm.value);
+        const unit = bm.unit ? String(bm.unit) : "";
+        const st = bm.state ? String(bm.state).toUpperCase() : "—";
+        const detail = bm.detail ? String(bm.detail) : "";
 
-  const plan = Array.isArray(s.plan) ? s.plan : [];
-  const lines = plan.map(p => `• ${p.pct}% ${p.item}`).join("<br>");
-
-  const c = document.createElement("div");
-  c.className = `card ${cls}`.trim();
-  c.innerHTML = `
-    <div class="k">Semáforo</div>
-    <div class="v">${color.toUpperCase()}</div>
-    <div class="u">${lines || "—"}</div>
-  `;
-  sem.appendChild(c);
-
-  // diferenciador
-  const d = hba?.differentiator?.what_distinguishes;
-  if(d){
-    const c2 = document.createElement("div");
-    c2.className = "card";
-    c2.innerHTML = `<div class="k">¿Qué te distingue?</div><div class="v">—</div><div class="u">${d}</div>`;
-    sem.appendChild(c2);
+        c.innerHTML = `
+          <div class="k">${bm.name}</div>
+          <div class="v">${val}</div>
+          <div class="u">${unit} • Estado: <b>${st}</b>${detail ? " • " + detail : ""}</div>
+        `;
+        bio.appendChild(c);
+      });
+    }
   }
-}
 
-function renderAll(metrics){
-  buildDashTiles(metrics);
-  buildBiomarkerCards(metrics);
-  buildMeaningCards(metrics);
-  buildNormsCards(metrics);
-  buildSemaforoCards(metrics);
+  // 2) Significados
+  const meanings = Array.isArray(dash.interpretation) ? dash.interpretation : [];
+  if(meaning){
+    if(!meanings.length){
+      const h = document.createElement("div");
+      h.className = "hint";
+      h.textContent = "Sin definiciones.";
+      meaning.appendChild(h);
+    } else {
+      meanings.forEach(m => {
+        const c = document.createElement("div");
+        c.className = "card";
+        c.innerHTML = `
+          <div class="k">${m.biomarker}</div>
+          <div class="v" style="font-size: clamp(16px, 1.8vw, 20px);">Guía</div>
+          <div class="u">${m.meaning}</div>
+        `;
+        meaning.appendChild(c);
+      });
+    }
+  }
+
+  // 3) Normas RMSSD por edad/sexo
+  if(norms){
+    const n = dash.norms || {};
+    const low = Number(n.rmssd_low);
+    const high = Number(n.rmssd_high);
+    const state = String(n.rmssd_state || "—").toUpperCase();
+    const age = n.age ?? "—";
+    const sex = n.sex ?? "—";
+
+    const c = document.createElement("div");
+    c.className = `card ${_stateToCardClass(String(n.rmssd_state||""))}`;
+    c.innerHTML = `
+      <div class="k">Referencia RMSSD (edad/sexo)</div>
+      <div class="v">${Number.isFinite(low) ? low.toFixed(0) : "—"} – ${Number.isFinite(high) ? high.toFixed(0) : "—"}</div>
+      <div class="u">Edad: <b>${age}</b> • Sexo: <b>${sex}</b> • Estado: <b>${state}</b></div>
+    `;
+    norms.appendChild(c);
+  }
+
+  // 4) Semáforo HBA (plan porcentual)
+  if(sema){
+    const s = dash.semaphore || {};
+    const color = String(s.color || "gris").toUpperCase();
+    const plan = Array.isArray(s.plan) ? s.plan : [];
+
+    const cls = _stateToCardClass(String(dash.norms?.rmssd_state || ""));
+    const c = document.createElement("div");
+    c.className = `card ${cls}`;
+    const itemsHtml = plan.map(p => {
+      const pct = Number(p.pct);
+      return `<div class="u" style="margin-top:6px;">• <b>${Number.isFinite(pct) ? pct : "—"}%</b> ${p.item}</div>`;
+    }).join("");
+
+    c.innerHTML = `
+      <div class="k">Semáforo HBA</div>
+      <div class="v" style="text-transform:uppercase">${color}</div>
+      <div class="u">Plan según RMSSD (edad/sexo):</div>
+      ${itemsHtml || `<div class="u">—</div>`}
+      <div class="u" style="margin-top:10px;"><b>Diferenciador:</b> ${dash.differentiator?.what_distinguishes || "Semáforo HBA"}</div>
+    `;
+    sema.appendChild(c);
+  }
 }
 
 /* ========================= Torch helpers ========================= */
@@ -472,6 +467,7 @@ function readTorchModeFromUI(){
   torchMode = (el && el.checked) ? "auto" : "off";
   setTorchLabel(torchMode === "auto" ? "AUTO" : "OFF");
 }
+
 function torchCapable(track){
   try{
     const caps = track?.getCapabilities?.();
@@ -480,8 +476,10 @@ function torchCapable(track){
     return false;
   }
 }
+
 let torchApplyInFlight = false;
 let lastTorchApplyAt = 0;
+
 function applyTorch(on){
   if(!trackRef || !torchAvailable) return;
   const now = Date.now();
@@ -629,7 +627,7 @@ function zscore(x){
 }
 
 /* ==========================================================
-   Camera PPG (PRO)
+   Camera PPG
 ========================================================== */
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
@@ -690,6 +688,7 @@ async function startCameraPPG(){
 
   setStatus("Cámara activa • recolectando PPG", "ok");
 
+  // ---------- estados de filtro en vivo ----------
   let baseline = null;
   const dcAlpha = 0.01;
 
@@ -965,7 +964,10 @@ async function stopPolarH10(){
 /* ========================= Measurement ========================= */
 async function startMeasurement(){
   lastMetrics = null;
-  clearDash();
+
+  buildCards(null);
+  buildDashTiles(null);
+  buildHBADashboard(null);
 
   measuring = true;
   startedAt = Date.now();
@@ -1017,7 +1019,7 @@ async function stopMeasurement(){
   const payload = {
     sensor_type: sensorType,
     duration_minutes: selectedDurationMin,
-    // si después agregás sexo en UI, mandalo acá:
+    // para normas por sexo si después lo agregás en UI:
     // sex: document.getElementById("sex")?.value || ""
     age: document.getElementById("age")?.value || ""
   };
@@ -1056,10 +1058,12 @@ async function stopMeasurement(){
     const metrics = await res.json();
     lastMetrics = metrics;
 
-    renderAll(metrics);
+    buildCards(metrics);
+    buildDashTiles(metrics);
+    buildHBADashboard(metrics);
 
     if(metrics.error){
-      setStatus("Error en cálculo (ver panel)", "bad");
+      setStatus("Error en cálculo (ver tarjetas)", "bad");
     } else {
       const art = Number(metrics.artifact_percent);
       if(Number.isFinite(art)){
@@ -1072,7 +1076,9 @@ async function stopMeasurement(){
     }
   }catch(e){
     lastMetrics = { error: e.message || String(e) };
-    renderAll(lastMetrics);
+    buildCards(lastMetrics);
+    buildDashTiles(lastMetrics);
+    buildHBADashboard(lastMetrics);
     setStatus("Fallo comunicando con servidor", "bad");
   }
 
@@ -1124,7 +1130,9 @@ window.addEventListener("DOMContentLoaded", () => {
   setupSensorSelector();
   setSensorChip();
   enableControls();
-  clearDash();
+  buildCards(null);
+  buildDashTiles(null);
+  buildHBADashboard(null);
   setQuality(null);
   setTimerText();
   setStatus("Listo", "idle");
@@ -1139,8 +1147,6 @@ window.addEventListener("DOMContentLoaded", () => {
         else applyTorch(true);
       }
     });
-  } else {
-    // si no existe, no pasa nada
   }
 
   document.getElementById("btnStart").addEventListener("click", async () => {
