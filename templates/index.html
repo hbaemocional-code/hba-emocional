@@ -1,144 +1,124 @@
 <!doctype html>
 <html lang="es">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>HBA Emocional - Fase 1 (Datos)</title>
-  <link rel="stylesheet" href="/static/css/style.css" />
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>HBA Emocional</title>
+<link rel="stylesheet" href="/static/css/style.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <div class="brand-dot"></div>
-      <div>
-        <div class="brand-title">HBA Emocional</div>
-        <div class="brand-subtitle">Recolección de HRV • Fase 1 (Datos)</div>
+<div class="app">
+
+<header class="topbar glass neon">
+  <div class="brand">
+    <div class="logoPulse"></div>
+    <div>
+      <div class="brandTitle">HBA Emocional</div>
+      <div class="brandSub">Sistema Nervioso Autónomo • HRV</div>
+    </div>
+  </div>
+
+  <div class="statusArea">
+    <div class="statusPill">
+      <div class="statusDot" id="statusDot"></div>
+      <div class="statusText" id="statusText">Listo</div>
+    </div>
+
+    <div class="chipRow">
+      <div class="chip chipTimer">
+        <span class="chipLabel">Tiempo</span>
+        <span class="chipValue" id="chipTimer">00:00</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+
+<main class="layout">
+
+<!-- PANEL IZQUIERDO -->
+<section class="panel panelLive glass neon">
+
+  <div class="chartCard">
+    <div class="chartHeader">
+      <div class="chartTitle">Señal en Tiempo Real</div>
+      <div class="qualityWrap">
+        <div class="qualityMeta">
+          <span class="qualityLabel">Calidad</span>
+          <span class="qualityText" id="qualityText">--</span>
+        </div>
+        <div class="qualityBar">
+          <div class="qualityFill" id="qualityFill"></div>
+        </div>
       </div>
     </div>
 
-    <div class="status-pill" id="statusPill">
-      <span class="status-dot" id="statusDot"></span>
-      <span id="statusText">Listo</span>
+    <div class="chartBody ecgGrid">
+      <canvas id="signalChart" class="signalChart"></canvas>
     </div>
-  </header>
 
-  <main class="container">
-    <section class="panel">
-      <h2>Configuración de Registro</h2>
+    <div class="freqHint" id="freqHint"></div>
+  </div>
 
-      <div class="grid-2">
-        <div class="field">
-          <label>ID Alumno</label>
-          <input id="studentId" type="text" placeholder="Ej: A-1029" />
-        </div>
-        <div class="field">
-          <label>Edad</label>
-          <input id="age" type="number" min="0" placeholder="Ej: 52" />
-        </div>
-      </div>
+</section>
 
-      <div class="field">
-        <label>Comorbilidades</label>
-        <input id="comorbidities" type="text" placeholder="Ej: HTA, DM2, EPOC" />
-      </div>
 
-      <div class="grid-2">
-        <div class="field">
-          <label>Sensor</label>
-          <select id="sensorType">
-            <option value="camera_ppg">Cámara (PPG)</option>
-            <option value="polar_h10">Polar H10 (BLE)</option>
-          </select>
-          <div class="hint">
-            Polar H10 requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost.
-          </div>
-        </div>
+<!-- PANEL DERECHO -->
+<section class="panel panelDash glass neon">
 
-        <div class="field">
-          <label>Duración</label>
-          <div class="segmented">
-            <button class="seg-btn active" data-min="3" id="dur3">3 minutos</button>
-            <button class="seg-btn" data-min="5" id="dur5">5 minutos</button>
-          </div>
-          <div class="hint">5 min recomendado para espectral (LF/HF) más estable.</div>
-        </div>
-      </div>
+  <div class="panelHeader">
+    <h2 class="panelTitle">Dashboard HBA</h2>
+    <div class="panelHint">Biomarcadores y semáforo autonómico</div>
+  </div>
 
-      <div class="actions">
-        <button class="btn primary" id="btnStart">Iniciar Medición</button>
-        <button class="btn" id="btnStop" disabled>Detener</button>
-        <button class="btn success" id="btnSave" disabled>Guardar Resultado</button>
-      </div>
+  <!-- DASH GRID -->
+  <div class="dashGrid" id="dashGrid"></div>
 
-      <div class="note">
-        <label>Notas (opcional)</label>
-        <input id="notes" type="text" placeholder="Ej: descanso 2 min previo, medicación, etc." />
-      </div>
-    </section>
+  <div class="divider"></div>
 
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Señal en Tiempo Real</h2>
-        <div class="mini">
-          <span class="chip" id="chipSensor">Sensor: Cámara (PPG)</span>
-          <span class="chip" id="chipTimer">00:00</span>
-        </div>
-      </div>
+  <!-- RESULTS CARDS -->
+  <div class="results">
+    <div class="resultsHeader">
+      <div class="resultsTitle">Detalle Biomarcadores</div>
+      <div class="resultsSub">Alto / Medio / Bajo según referencia</div>
+    </div>
+    <div class="cards" id="cards"></div>
+  </div>
 
-      <div class="chart-wrap">
-        <canvas id="signalChart"></canvas>
-      </div>
+  <div class="divider"></div>
 
-      <video id="video" playsinline autoplay muted class="hidden"></video>
-      <canvas id="frameCanvas" class="hidden"></canvas>
-    </section>
+  <!-- NORMAS -->
+  <div class="results">
+    <div class="resultsHeader">
+      <div class="resultsTitle">RMSSD según Edad</div>
+    </div>
+    <div class="cards" id="normsCards"></div>
+  </div>
 
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Data Details</h2>
-        <div class="hint" id="freqHint"></div>
-      </div>
+  <div class="divider"></div>
 
-      <div class="cards" id="cards"></div>
+  <!-- SEMAFORO -->
+  <div class="results">
+    <div class="resultsHeader">
+      <div class="resultsTitle">Semáforo HBA</div>
+      <div class="resultsSub">Plan porcentual según carga autonómica</div>
+    </div>
+    <div class="cards" id="semaforoCards"></div>
+  </div>
 
-      <!-- ===================================================== -->
-      <!-- DASHBOARD HBA (mismo sistema de "cards", sin tablas)  -->
-      <!-- ===================================================== -->
+</section>
 
-      <div class="panel-head" style="margin-top:16px;">
-        <h2>Cuadro de Biomarcadores</h2>
-        <div class="hint">Biomarcador + estado (alto/medio/bajo) + lectura práctica.</div>
-      </div>
-      <div class="cards" id="bioCards"></div>
+</main>
 
-      <div class="panel-head" style="margin-top:16px;">
-        <h2>¿Qué significa cada biomarcador?</h2>
-        <div class="hint">Guía práctica (no diagnóstico).</div>
-      </div>
-      <div class="cards" id="meaningCards"></div>
+<footer class="footer">
+  <div>© HBA Emocional</div>
+  <div>Uso científico • No diagnóstico médico</div>
+</footer>
 
-      <div class="panel-head" style="margin-top:16px;">
-        <h2>RMSSD por edad</h2>
-        <div class="hint">Bajo / Normal / Alto (orientativo). Base del semáforo.</div>
-      </div>
-      <div class="cards" id="normsCards"></div>
+</div>
 
-      <div class="panel-head" style="margin-top:16px;">
-        <h2>Semáforo HBA</h2>
-        <div class="hint">Tu diferenciador: plan porcentual según carga autonómica (RMSSD).</div>
-      </div>
-      <div class="cards" id="semaforoCards"></div>
-    </section>
-  </main>
-
-  <footer class="footer">
-    <div>© HBA Emocional • Fase 1</div>
-    <div class="footer-hint">Uso científico / rehabilitación. No diagnóstico.</div>
-  </footer>
-
-  <!-- Si tenés cache agresivo, subí a v=2 -->
-  <script src="/static/js/main.js?v=2"></script>
+<script src="/static/js/main.js"></script>
 </body>
 </html>
