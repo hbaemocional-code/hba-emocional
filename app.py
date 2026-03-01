@@ -320,7 +320,6 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
         hrv_time = nk.hrv_time(rri=rr_clean, show=False)
         hrv_freq = nk.hrv_frequency(rri=rr_clean, show=False)
     except Exception as e:
-        # ✅ ESTE ES EL FIX PRINCIPAL: fallback idéntico a Polar
         peaks_bin = rri_to_peaks(rr_clean, sampling_rate=1000)
         if peaks_bin is None:
             return {"error": f"Fallo calculando HRV desde RR (PPG): {str(e)}", "artifact_percent": artifact_final}
@@ -381,6 +380,265 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
         "n_rr": int(len(rr_clean)),
         "n_peaks": int(len(peaks_idx_used))
     }
+
+
+# ============================
+# HBA Dashboard (CUADROS + SEMÁFORO)
+# ============================
+
+def baevsky_index(nn_ms: np.ndarray):
+    nn_ms = _finite_array(nn_ms)
+    if nn_ms.size < 50:
+        return np.nan
+    hist, edges = np.histogram(nn_ms, bins=50)
+    mode_idx = int(np.argmax(hist))
+    Mo = float((edges[mode_idx] + edges[mode_idx + 1]) / 2.0)  # ms
+    AMo = float(hist[mode_idx] / nn_ms.size * 100.0)           # %
+    MxDMn = float(np.max(nn_ms) - np.min(nn_ms))               # ms
+    if Mo <= 0 or MxDMn <= 0:
+        return np.nan
+    SI = AMo / (2.0 * (Mo / 1000.0) * (MxDMn / 1000.0))
+    return float(SI) if np.isfinite(SI) else np.nan
+
+
+def classify_hml(value, low, high):
+    v = _as_float(value)
+    if not np.isfinite(v):
+        return "insuficiente"
+    if v < low:
+        return "bajo"
+    if v > high:
+        return "alto"
+    return "medio"
+
+
+def rmssd_reference_by_age_sex(age, sex):
+    a = _as_float(age)
+    s = (str(sex).upper().strip() if sex is not None else "X")
+
+    if not np.isfinite(a):
+        low, high = 25.0, 55.0
+        return low, high
+
+    a = int(a)
+    if a < 20:
+        low, high = 35.0, 80.0
+    elif a < 30:
+        low, high = 30.0, 70.0
+    elif a < 40:
+        low, high = 25.0, 60.0
+    elif a < 50:
+        low, high = 20.0, 50.0
+    elif a < 60:
+        low, high = 18.0, 45.0
+    else:
+        low, high = 15.0, 40.0
+
+    # Ajuste mínimo opcional por sexo
+    if s == "F":
+        high += 2.0
+
+    return float(low), float(high)
+
+
+def autonomic_score_0_100(rmssd, lfhf, baevsky_si):
+    parts = []
+
+    r = _as_float(rmssd)
+    if np.isfinite(r):
+        x = np.clip((80.0 - r) / (80.0 - 15.0), 0.0, 1.0)
+        parts.append(x)
+
+    lf = _as_float(lfhf)
+    if np.isfinite(lf):
+        x = np.clip((lf - 1.0) / (5.0 - 1.0), 0.0, 1.0)
+        parts.append(x)
+
+    si = _as_float(baevsky_si)
+    if np.isfinite(si):
+        x = np.clip((si - 50.0) / (500.0 - 50.0), 0.0, 1.0)
+        parts.append(x)
+
+    if not parts:
+        return np.nan
+    return float(np.mean(parts) * 100.0)
+
+
+def fatigue_scores_0_100(rmssd, sdnn, hr_mean):
+    rm = _as_float(rmssd)
+    sd = _as_float(sdnn)
+    hr = _as_float(hr_mean)
+
+    phys_parts = []
+    emo_parts = []
+
+    if np.isfinite(sd):
+        phys_parts.append(np.clip((80.0 - sd) / (80.0 - 20.0), 0.0, 1.0))
+    if np.isfinite(hr):
+        phys_parts.append(np.clip((hr - 55.0) / (95.0 - 55.0), 0.0, 1.0))
+
+    if np.isfinite(rm):
+        emo_parts.append(np.clip((60.0 - rm) / (60.0 - 15.0), 0.0, 1.0))
+    if np.isfinite(hr):
+        emo_parts.append(np.clip((hr - 55.0) / (95.0 - 55.0), 0.0, 1.0))
+
+    phys = float(np.mean(phys_parts) * 100.0) if phys_parts else np.nan
+    emo = float(np.mean(emo_parts) * 100.0) if emo_parts else np.nan
+    return phys, emo
+
+
+def semaphore_plan(rmssd_state):
+    # NO CAMBIAR tu lógica
+    if rmssd_state == "bajo":
+        return {
+            "color": "rojo",
+            "plan": [
+                {"item": "Equilibrio SNA / patrón respiratorio / visualización", "pct": 60},
+                {"item": "Tejido miofascial (40% tensión e intensidad)", "pct": 40},
+                {"item": "Ejercicios de columna", "pct": 20},
+                {"item": "Ejercicio biomecánico funcional", "pct": 10},
+                {"item": "Relax", "pct": 10},
+            ],
+        }
+    if rmssd_state == "medio":
+        return {
+            "color": "amarillo",
+            "plan": [
+                {"item": "Equilibrio SNA", "pct": 40},
+                {"item": "Tejido miofascial (60% tensión e intensidad)", "pct": 60},
+                {"item": "Ejercicios de columna", "pct": 20},
+                {"item": "Ejercicios biomecánicos funcionales", "pct": 30},
+                {"item": "Relax", "pct": 10},
+            ],
+        }
+    if rmssd_state == "alto":
+        return {
+            "color": "verde",
+            "plan": [
+                {"item": "Equilibrio SNA", "pct": 30},
+                {"item": "Tejido miofascial (máxima tensión e intensidad)", "pct": 100},
+                {"item": "Ejercicios biomecánicos funcionales", "pct": 40},
+                {"item": "Ejercicios de columna", "pct": 20},
+                {"item": "Relax", "pct": 10},
+            ],
+        }
+    return {"color": "gris", "plan": []}
+
+
+def biomarker_meanings():
+    return [
+        {"biomarker": "HRV (RMSSD)", "meaning": "Variabilidad a corto plazo; asociada a modulación parasimpática (vagal) y recuperación."},
+        {"biomarker": "lnRMSSD", "meaning": "RMSSD en escala log; más estable para seguimiento."},
+        {"biomarker": "SDNN", "meaning": "Variabilidad global; refleja balance autonómico general."},
+        {"biomarker": "LF/HF", "meaning": "Indicador aproximado de balance simpático/parasimpático (muy sensible a respiración y duración)."},
+        {"biomarker": "Baevsky (SI)", "meaning": "Índice de estrés basado en distribución de RR; alto suele indicar mayor tensión autonómica."},
+        {"biomarker": "Score autonómico", "meaning": "Score compuesto (0–100) que resume carga autonómica con RMSSD + LF/HF + Baevsky."},
+        {"biomarker": "Fatiga física", "meaning": "Heurístico (0–100) combinando SDNN y FC media."},
+        {"biomarker": "Fatiga emocional", "meaning": "Heurístico (0–100) combinando RMSSD y FC media."},
+        {"biomarker": "Carga autonómica", "meaning": "Interpretación práctica del score autonómico (bajo/medio/alto)."},
+    ]
+
+
+def enrich_hba_dashboard(result: dict, payload: dict):
+    # ✅ Si hay error, no armamos dashboard (evita basura/NaN)
+    if result.get("error"):
+        return result
+
+    age = payload.get("age", None)
+    sex = payload.get("sex", None)
+
+    rmssd = _as_float(result.get("rmssd"))
+    sdnn = _as_float(result.get("sdnn"))
+    lnrmssd = _as_float(result.get("lnrmssd"))
+    lfhf = _as_float(result.get("lf_hf"))
+    hr_mean = _as_float(result.get("hr_mean"))
+
+    baevsky = np.nan
+
+    # Polar: usar rri_ms directo
+    if str(result.get("sensor_type", "")).strip() == "polar_h10":
+        rri_ms = payload.get("rri_ms", [])
+        if isinstance(rri_ms, list) and len(rri_ms) >= 12:
+            rr = _finite_array(np.array(rri_ms, dtype=float))
+            rr_clean, _ap, _mask = clean_rri_ms(rr)
+            baevsky = baevsky_index(rr_clean)
+
+    # Cámara: recalcular RR mínimo para Baevsky (sin tocar tu lógica principal)
+    if str(result.get("sensor_type", "")).strip() == "camera_ppg":
+        ppg = payload.get("ppg", [])
+        sr = _as_float(payload.get("sampling_rate", result.get("sampling_rate", 30)))
+        try:
+            ppg_arr = _finite_array(np.array(ppg, dtype=float))
+            if ppg_arr.size > 0 and np.isfinite(sr) and sr > 1:
+                p = ppg_arr - np.nanmean(ppg_arr)
+                p = p / (np.nanstd(p) + 1e-9)
+                try:
+                    p = nk.signal_filter(p, sampling_rate=sr, lowcut=0.5, highcut=8.0, method="butterworth", order=3)
+                except Exception:
+                    pass
+                _peaks, info = nk.ppg_peaks(p, sampling_rate=sr, method="elgendi")
+                peaks_idx = info.get("PPG_Peaks", info.get("peaks", None))
+                if peaks_idx is not None:
+                    peaks_idx = np.asarray(peaks_idx, dtype=int)
+                    peaks_idx = peaks_idx[(peaks_idx > 0) & (peaks_idx < len(p))]
+                    if len(peaks_idx) >= 12:
+                        rr_ms = np.diff(peaks_idx) / sr * 1000.0
+                        rr_clean, _ap, _mask = clean_rri_ms(rr_ms)
+                        baevsky = baevsky_index(rr_clean)
+        except Exception:
+            pass
+
+    # Normas RMSSD por edad/sexo
+    rm_low, rm_high = rmssd_reference_by_age_sex(age, sex)
+    rm_state = classify_hml(rmssd, rm_low, rm_high)
+
+    # Score autonómico + carga autonómica
+    auto_score = autonomic_score_0_100(rmssd, lfhf, baevsky)
+    load_state = classify_hml(auto_score, 35.0, 65.0)
+
+    # Estrés (Baevsky)
+    baev_state = classify_hml(baevsky, 150.0, 300.0)
+
+    # Fatigas
+    fat_phys, fat_emo = fatigue_scores_0_100(rmssd, sdnn, hr_mean)
+    fat_phys_state = classify_hml(fat_phys, 35.0, 65.0)
+    fat_emo_state = classify_hml(fat_emo, 35.0, 65.0)
+
+    # Semáforo (tu diferenciador)
+    sem = semaphore_plan(rm_state)
+
+    biomarkers = [
+        {"name": "HRV (RMSSD)", "value": rmssd, "unit": "ms", "state": rm_state,
+         "detail": f"Ref edad/sexo: bajo<{rm_low:.0f} / alto>{rm_high:.0f}"},
+        {"name": "lnRMSSD", "value": lnrmssd, "unit": "", "state": "informativo", "detail": ""},
+        {"name": "SDNN", "value": sdnn, "unit": "ms", "state": classify_hml(sdnn, 30.0, 60.0), "detail": ""},
+        {"name": "FC media", "value": hr_mean, "unit": "bpm", "state": classify_hml(hr_mean, 60.0, 85.0), "detail": ""},
+        {"name": "LF/HF", "value": lfhf, "unit": "", "state": classify_hml(lfhf, 1.5, 3.0), "detail": result.get("freq_warning") or ""},
+        {"name": "Índice de estrés Baevsky", "value": baevsky, "unit": "", "state": baev_state, "detail": ""},
+        {"name": "Score autonómico", "value": auto_score, "unit": "/100", "state": load_state, "detail": "Más alto = más carga autonómica"},
+        {"name": "Carga autonómica", "value": auto_score, "unit": "/100", "state": load_state, "detail": ""},
+        {"name": "Estrés", "value": auto_score, "unit": "/100", "state": load_state, "detail": ""},
+        {"name": "Fatiga física", "value": fat_phys, "unit": "/100", "state": fat_phys_state, "detail": ""},
+        {"name": "Fatiga emocional", "value": fat_emo, "unit": "/100", "state": fat_emo_state, "detail": ""},
+    ]
+
+    result["hba_dashboard"] = {
+        "biomarkers": biomarkers,
+        "interpretation": biomarker_meanings(),
+        "norms": {
+            "age": age,
+            "sex": sex,
+            "rmssd_low": rm_low,
+            "rmssd_high": rm_high,
+            "rmssd_state": rm_state,
+        },
+        "semaphore": sem,
+        "differentiator": {
+            "what_distinguishes": "Semáforo HBA: traduce tu HRV (RMSSD por edad/sexo) en un plan porcentual de intervención (SNA / miofascial / columna / biomecánico / relax)."
+        },
+    }
+
+    return result
 
 
 # ============================
@@ -450,6 +708,7 @@ def api_compute():
         result = compute_hrv_from_rri(np.array(rri_ms, dtype=float), duration_minutes=duration_minutes)
         result["sensor_type"] = "polar_h10"
         result["duration_minutes"] = duration_minutes
+        result = enrich_hba_dashboard(result, payload)
         return jsonify(_sanitize_for_json(result))
 
     if sensor_type == "camera_ppg":
@@ -458,6 +717,7 @@ def api_compute():
         result = compute_hrv_from_ppg(np.array(ppg, dtype=float), float(sampling_rate), duration_minutes=duration_minutes)
         result["sensor_type"] = "camera_ppg"
         result["duration_minutes"] = duration_minutes
+        result = enrich_hba_dashboard(result, payload)
         return jsonify(_sanitize_for_json(result))
 
     return jsonify(_sanitize_for_json({"error": "sensor_type inválido. Use 'camera_ppg' o 'polar_h10'."})), 400
