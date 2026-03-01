@@ -427,10 +427,6 @@ function zscore(x){
 
 /* ==========================================================
    Camera PPG (SOLUCIÓN PRO)
-   - AC-only real: separa DC/AC para que presión/exposición NO dominen
-   - Filtro en vivo simple: HP + LP (banda cardiaca)
-   - Torch AUTO: evita saturación y calor (apaga si quema, prende si oscuro)
-   - Calidad: amplitud + estabilidad de periodo (no “amplitud sola”)
 ========================================================== */
 async function startCameraPPG(){
   videoEl = document.getElementById("video");
@@ -491,37 +487,29 @@ async function startCameraPPG(){
 
   setStatus("Cámara activa • recolectando PPG", "ok");
 
-  // ---------- estados de filtro en vivo ----------
-  // DC baseline (lento)
   let baseline = null;
-  const dcAlpha = 0.01; // más lento => menos sensibilidad a presión/exposición
+  const dcAlpha = 0.01;
 
-  // High-pass (diferencia + estado)
   let hpState = 0;
   let prevNorm = null;
   const hpAlpha = 0.96;
 
-  // Low-pass (suavizado)
   let lpState = 0;
   const lpAlpha = 0.18;
 
-  // Calidad: buffers
-  const winN = Math.round(2.5 * targetFps);   // ventana de 2.5s
+  const winN = Math.round(2.5 * targetFps);
   const buf = [];
-  const peakTimes = []; // picos aproximados para estabilidad (solo calidad)
+  const peakTimes = [];
   let lastMsgAt = 0;
 
-  // Torch AUTO: thresholds (objetivo es evitar saturación/oscuro)
   const SAT_HIGH = 242;
   const DARK_LOW = 55;
   let satStreak = 0;
   let darkStreak = 0;
 
-  // Detección picos para calidad (NO para RR final)
   let prev2 = 0, prev1 = 0, cur = 0;
   let lastPeakAt = 0;
 
-  // Scheduler 30fps estable
   const framePeriod = 1000 / targetFps;
   let lastTick = performance.now();
   let acc = 0;
@@ -547,7 +535,6 @@ async function startCameraPPG(){
       const img = frameCtx.getImageData(0, 0, roiW, roiH).data;
       const meanR = meanRedROI(img);
 
-      // Torch AUTO inteligente (sin intensidad variable, solo ON/OFF)
       const clipped = meanR >= SAT_HIGH;
       const tooDark = meanR <= DARK_LOW;
 
@@ -563,90 +550,68 @@ async function startCameraPPG(){
       }
 
       if(torchAvailable && torchMode === "auto"){
-        // si “quema” sostenido, apagar para bajar calor y evitar saturación
         if(satStreak >= 5){
           satStreak = 0;
           if(torchEnabled) applyTorch(false);
         }
-        // si está oscuro sostenido, prender
         if(darkStreak >= 5){
           darkStreak = 0;
           if(!torchEnabled) applyTorch(true);
         }
       }
 
-      // =========================
-      // SEÑAL PRO: AC-only real
-      // =========================
       if(baseline === null) baseline = meanR;
       baseline = (1 - dcAlpha) * baseline + dcAlpha * meanR;
 
-      // AC (microvariación) y normalización relativa (reduce presión)
       let ac = meanR - baseline;
       let norm = 0;
       if(baseline > 12) norm = ac / baseline;
 
-      // High-pass (elimina deriva residual)
       if(prevNorm === null) prevNorm = norm;
       hpState = hpAlpha * (hpState + norm - prevNorm);
       prevNorm = norm;
 
-      // Low-pass (quita dientes/serrucho)
       lpState = lpState + lpAlpha * (hpState - lpState);
 
-      // Clamp suave para cortar spikes digitales de exposición
       let clean = lpState;
       if(clean > 0.06) clean = 0.06;
       if(clean < -0.06) clean = -0.06;
 
-      // Guardar señal (la que va al backend)
       ppgTimestamps.push(performance.now());
       ppgSamples.push(clean);
 
-      // Visual (más suave y proporcional)
       pushChartPoint(clean * 220);
 
-      // =========================
-      // Calidad REAL (amplitud + estabilidad)
-      // =========================
       buf.push(clean);
       if(buf.length > winN) buf.shift();
 
-      // detección de pico simple para estabilidad (solo calidad):
-      // pico cuando hay máximo local y pasó un refractory mínimo
       prev2 = prev1;
       prev1 = cur;
       cur = clean;
 
       const tNow = performance.now();
-      const refractoryMs = 330; // ~180 bpm max
+      const refractoryMs = 330;
       if(prev1 > prev2 && prev1 > cur && (tNow - lastPeakAt) > refractoryMs){
-        // umbral adaptativo simple: pico debe superar amplitud mínima local
-        // (no “estricto”: si hay señal baja, igual detecta pocos y la calidad baja)
         let mn = Infinity, mx = -Infinity;
         for(const v of buf){ if(v < mn) mn = v; if(v > mx) mx = v; }
         const p2p = mx - mn;
-        if(p2p > 0.004){ // umbral mínimo muy bajo
+        if(p2p > 0.004){
           peakTimes.push(tNow);
           lastPeakAt = tNow;
-          // mantener últimos 8–10 picos
           while(peakTimes.length > 10) peakTimes.shift();
         }
       }
 
-      // calcular score cada ~350ms
       if(buf.length >= Math.round(1.5 * targetFps)){
         const nowMs = Date.now();
         if(nowMs - lastMsgAt > 350){
           lastMsgAt = nowMs;
 
-          // amplitud
           let mn = Infinity, mx = -Infinity;
           for(const v of buf){ if(v < mn) mn = v; if(v > mx) mx = v; }
           const p2p = mx - mn;
 
-          // estabilidad de periodo (si hay picos)
-          let stab = 0; // 0..1
+          let stab = 0;
           if(peakTimes.length >= 5){
             const rr = [];
             for(let i=1;i<peakTimes.length;i++) rr.push(peakTimes[i]-peakTimes[i-1]);
@@ -654,29 +619,21 @@ async function startCameraPPG(){
             let v = 0;
             for(const x of rr) v += (x-m)*(x-m);
             const sd = Math.sqrt(v/rr.length);
-            // coef var bajo => estable
             const cv = sd / (m + 1e-6);
-            // map: cv 0.05 => muy estable; cv 0.25 => pobre
             stab = 1 - Math.min(1, Math.max(0, (cv - 0.05) / 0.20));
           } else {
-            // sin suficientes picos => baja
             stab = 0.15;
           }
 
-          // amplitud score (p2p típico de clean es pequeño)
-          // map aproximado: 0.004..0.02
           const ampScore = Math.max(0, Math.min(1, (p2p - 0.0035) / 0.0165));
 
-          // penalización por saturación/oscuro
           let lightPenalty = 1.0;
           if(clipped) lightPenalty *= 0.65;
           if(tooDark) lightPenalty *= 0.75;
 
-          // score final
           const score = 100 * lightPenalty * (0.55 * ampScore + 0.45 * stab);
           setQuality(score);
 
-          // Mensajes (pocos, útiles)
           if(clipped){
             setStatus("Flash quema • AUTO bajará luz / aflojá presión", "warn");
           } else if(tooDark){
@@ -706,7 +663,6 @@ async function stopCameraPPG(){
 
   try{
     if(trackRef && torchAvailable){
-      // siempre apagar al salir para no calentar
       applyTorch(false);
     }
   }catch(_e){}
@@ -855,9 +811,12 @@ async function stopMeasurement(){
 
   setStatus("Procesando HRV…", "warn");
 
+  // ✅ Agregado: age + sex (para RMSSD por edad/sexo y semáforo)
   const payload = {
     sensor_type: sensorType,
-    duration_minutes: selectedDurationMin
+    duration_minutes: selectedDurationMin,
+    age: document.getElementById("age")?.value || "",
+    sex: document.getElementById("sex")?.value || "X"
   };
 
   if(sensorType === "camera_ppg"){
@@ -871,7 +830,6 @@ async function stopMeasurement(){
       if(meanDt > 0) fs = 1.0 / meanDt;
     }
 
-    // Sanitización fuerte (como ya lo tenías)
     let cleaned = replaceNonFinite(ppgSamples);
     cleaned = clampByMAD(cleaned, 10.0);
     cleaned = detrendMovingAverage(cleaned, fs, 1.8);
@@ -896,6 +854,9 @@ async function stopMeasurement(){
     lastMetrics = metrics;
 
     buildCards(metrics);
+
+    // ✅ Agregado: render cuadros + semáforo al final
+    renderHBADashboard(metrics);
 
     if(metrics.error){
       setStatus("Error en cálculo (ver tarjetas)", "bad");
@@ -999,3 +960,114 @@ window.addEventListener("DOMContentLoaded", () => {
     await saveResult();
   });
 });
+
+/* ==========================================================
+   HBA Dashboard Renderer (3 cuadros + semáforo)
+   Requiere backend: metrics.hba_dashboard
+========================================================== */
+function _fmt(v, d=2){
+  if(v === null || v === undefined) return "—";
+  if(typeof v !== "number") return String(v);
+  if(!Number.isFinite(v)) return "—";
+  return v.toFixed(d);
+}
+
+function _semBorder(color){
+  if(color === "rojo") return "var(--bad)";
+  if(color === "amarillo") return "var(--warn)";
+  if(color === "verde") return "var(--ok)";
+  return "rgba(255,255,255,0.15)";
+}
+
+function renderHBADashboard(metrics){
+  const dash = metrics && metrics.hba_dashboard ? metrics.hba_dashboard : null;
+
+  // Si backend no trae dash, limpiamos para que no quede basura
+  const bioBody = document.getElementById("bioTableBody");
+  const meaningBody = document.getElementById("meaningTableBody");
+  const normsBody = document.getElementById("normsTableBody");
+  const planBody = document.getElementById("semaforoPlanBody");
+  const colorEl = document.getElementById("semaforoColor");
+  const box = document.getElementById("semaforoBox");
+  const diffEl = document.getElementById("differentiatorText");
+
+  if(!dash){
+    if(bioBody) bioBody.innerHTML = "";
+    if(meaningBody) meaningBody.innerHTML = "";
+    if(normsBody) normsBody.innerHTML = "";
+    if(planBody) planBody.innerHTML = "";
+    if(colorEl) colorEl.textContent = "—";
+    if(diffEl) diffEl.textContent = "";
+    if(box) box.style.borderColor = "rgba(255,255,255,0.15)";
+    return;
+  }
+
+  // Cuadro 1
+  if(bioBody){
+    bioBody.innerHTML = "";
+    (dash.biomarkers || []).forEach(b => {
+      const tr = document.createElement("tr");
+      const value = (typeof b.value === "number") ? _fmt(b.value, 2) : (b.value ?? "—");
+      tr.innerHTML = `
+        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06);">${b.name || ""}</td>
+        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${value} ${b.unit || ""}</td>
+        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${b.state || "—"}</td>
+        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); opacity:.8; font-size:12px; font-family:ui-monospace, Menlo, monospace;">${b.detail || ""}</td>
+      `;
+      bioBody.appendChild(tr);
+    });
+  }
+
+  // Cuadro 2
+  if(meaningBody){
+    meaningBody.innerHTML = "";
+    (dash.interpretation || []).forEach(x => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06);">${x.biomarker || ""}</td>
+        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06);">${x.meaning || ""}</td>
+      `;
+      meaningBody.appendChild(tr);
+    });
+  }
+
+  // Cuadro 3
+  if(normsBody){
+    normsBody.innerHTML = "";
+    const n = dash.norms || {};
+    const low = n.rmssd_low;
+    const high = n.rmssd_high;
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${n.age ?? "—"}</td>
+      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">&lt; ${_fmt(low, 0)} ms</td>
+      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${_fmt(low, 0)}–${_fmt(high, 0)} ms</td>
+      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">&gt; ${_fmt(high, 0)} ms</td>
+      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${n.rmssd_state || "—"}</td>
+    `;
+    normsBody.appendChild(tr);
+  }
+
+  // Semáforo
+  const sem = dash.semaphore || {};
+  const color = sem.color || "gris";
+  if(colorEl) colorEl.textContent = color;
+  if(box) box.style.borderColor = _semBorder(color);
+
+  if(planBody){
+    planBody.innerHTML = "";
+    (sem.plan || []).forEach(p => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06);">${p.item || ""}</td>
+        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${p.pct ?? "—"}%</td>
+      `;
+      planBody.appendChild(tr);
+    });
+  }
+
+  if(diffEl){
+    diffEl.textContent = dash.differentiator?.what_distinguishes || "";
+  }
+}
