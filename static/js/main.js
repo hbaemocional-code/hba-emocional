@@ -763,6 +763,7 @@ async function stopPolarH10(){
 async function startMeasurement(){
   lastMetrics = null;
   buildCards(null);
+  renderHBADashboard(null);
 
   measuring = true;
   startedAt = Date.now();
@@ -811,12 +812,12 @@ async function stopMeasurement(){
 
   setStatus("Procesando HRV…", "warn");
 
-  // ✅ Agregado: age + sex (para RMSSD por edad/sexo y semáforo)
+  // ✅ NO tocamos UI: solo mandamos age (ya existe) y sex default "X"
   const payload = {
     sensor_type: sensorType,
     duration_minutes: selectedDurationMin,
     age: document.getElementById("age")?.value || "",
-    sex: document.getElementById("sex")?.value || "X"
+    sex: "X"
   };
 
   if(sensorType === "camera_ppg"){
@@ -854,8 +855,6 @@ async function stopMeasurement(){
     lastMetrics = metrics;
 
     buildCards(metrics);
-
-    // ✅ Agregado: render cuadros + semáforo al final
     renderHBADashboard(metrics);
 
     if(metrics.error){
@@ -873,6 +872,7 @@ async function stopMeasurement(){
   }catch(e){
     lastMetrics = { error: e.message || String(e) };
     buildCards(lastMetrics);
+    renderHBADashboard(null);
     setStatus("Fallo comunicando con servidor", "bad");
   }
 
@@ -925,6 +925,7 @@ window.addEventListener("DOMContentLoaded", () => {
   setSensorChip();
   enableControls();
   buildCards(null);
+  renderHBADashboard(null);
   setQuality(null);
   setTimerText();
   setStatus("Listo", "idle");
@@ -962,112 +963,137 @@ window.addEventListener("DOMContentLoaded", () => {
 });
 
 /* ==========================================================
-   HBA Dashboard Renderer (3 cuadros + semáforo)
-   Requiere backend: metrics.hba_dashboard
+   HBA Dashboard: render en "cards" (NO tablas, NO inline)
 ========================================================== */
-function _fmt(v, d=2){
-  if(v === null || v === undefined) return "—";
-  if(typeof v !== "number") return String(v);
-  if(!Number.isFinite(v)) return "—";
-  return v.toFixed(d);
+
+function _num(v){
+  const n = (typeof v === "number") ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-function _semBorder(color){
-  if(color === "rojo") return "var(--bad)";
-  if(color === "amarillo") return "var(--warn)";
-  if(color === "verde") return "var(--ok)";
-  return "rgba(255,255,255,0.15)";
+function _fmt(v, decimals=2){
+  const n = _num(v);
+  if(n === null) return "—";
+  return n.toFixed(decimals);
+}
+
+function _stateClass(state){
+  // usa tus estilos good/warn/bad
+  const s = String(state || "").toLowerCase();
+  if(s.includes("alto")) return "good";
+  if(s.includes("bajo")) return "bad";
+  if(s.includes("medio")) return "warn";
+  // para "informativo/insuficiente"
+  return "";
+}
+
+function _clearContainers(){
+  const ids = ["bioCards","meaningCards","normsCards","semaforoCards"];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if(el) el.innerHTML = "";
+  });
 }
 
 function renderHBADashboard(metrics){
-  const dash = metrics && metrics.hba_dashboard ? metrics.hba_dashboard : null;
-
-  // Si backend no trae dash, limpiamos para que no quede basura
-  const bioBody = document.getElementById("bioTableBody");
-  const meaningBody = document.getElementById("meaningTableBody");
-  const normsBody = document.getElementById("normsTableBody");
-  const planBody = document.getElementById("semaforoPlanBody");
-  const colorEl = document.getElementById("semaforoColor");
-  const box = document.getElementById("semaforoBox");
-  const diffEl = document.getElementById("differentiatorText");
-
-  if(!dash){
-    if(bioBody) bioBody.innerHTML = "";
-    if(meaningBody) meaningBody.innerHTML = "";
-    if(normsBody) normsBody.innerHTML = "";
-    if(planBody) planBody.innerHTML = "";
-    if(colorEl) colorEl.textContent = "—";
-    if(diffEl) diffEl.textContent = "";
-    if(box) box.style.borderColor = "rgba(255,255,255,0.15)";
+  if(!metrics || metrics.error || !metrics.hba_dashboard){
+    _clearContainers();
     return;
   }
 
-  // Cuadro 1
-  if(bioBody){
-    bioBody.innerHTML = "";
+  const dash = metrics.hba_dashboard;
+
+  // ---------- Biomarcadores ----------
+  const bioEl = document.getElementById("bioCards");
+  if(bioEl){
+    bioEl.innerHTML = "";
     (dash.biomarkers || []).forEach(b => {
-      const tr = document.createElement("tr");
-      const value = (typeof b.value === "number") ? _fmt(b.value, 2) : (b.value ?? "—");
-      tr.innerHTML = `
-        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06);">${b.name || ""}</td>
-        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${value} ${b.unit || ""}</td>
-        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${b.state || "—"}</td>
-        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); opacity:.8; font-size:12px; font-family:ui-monospace, Menlo, monospace;">${b.detail || ""}</td>
+      const cls = _stateClass(b.state);
+      const card = document.createElement("div");
+      card.className = cls ? `card ${cls}` : "card";
+
+      const val = (typeof b.value === "number") ? _fmt(b.value, 2) : (b.value ?? "—");
+      const unit = b.unit ? ` ${b.unit}` : "";
+      const st = b.state || "—";
+      const detail = b.detail || "";
+
+      // Reutiliza el mismo layout k/v/u
+      card.innerHTML = `
+        <div class="k">${b.name || ""}</div>
+        <div class="v">${val}${unit}</div>
+        <div class="u">${st}${detail ? " • " + detail : ""}</div>
       `;
-      bioBody.appendChild(tr);
+      bioEl.appendChild(card);
     });
   }
 
-  // Cuadro 2
-  if(meaningBody){
-    meaningBody.innerHTML = "";
-    (dash.interpretation || []).forEach(x => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06);">${x.biomarker || ""}</td>
-        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06);">${x.meaning || ""}</td>
+  // ---------- Significados ----------
+  const meaningEl = document.getElementById("meaningCards");
+  if(meaningEl){
+    meaningEl.innerHTML = "";
+    (dash.interpretation || []).forEach(m => {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `
+        <div class="k">${m.biomarker || ""}</div>
+        <div class="u">${m.meaning || ""}</div>
       `;
-      meaningBody.appendChild(tr);
+      meaningEl.appendChild(card);
     });
   }
 
-  // Cuadro 3
-  if(normsBody){
-    normsBody.innerHTML = "";
+  // ---------- Normas RMSSD ----------
+  const normsEl = document.getElementById("normsCards");
+  if(normsEl){
+    normsEl.innerHTML = "";
     const n = dash.norms || {};
-    const low = n.rmssd_low;
-    const high = n.rmssd_high;
+    const low = _num(n.rmssd_low);
+    const high = _num(n.rmssd_high);
 
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${n.age ?? "—"}</td>
-      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">&lt; ${_fmt(low, 0)} ms</td>
-      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${_fmt(low, 0)}–${_fmt(high, 0)} ms</td>
-      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">&gt; ${_fmt(high, 0)} ms</td>
-      <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${n.rmssd_state || "—"}</td>
+    const card = document.createElement("div");
+    card.className = _stateClass(n.rmssd_state) ? `card ${_stateClass(n.rmssd_state)}` : "card";
+
+    const age = (n.age === "" || n.age == null) ? "—" : String(n.age);
+    const sex = (n.sex === "" || n.sex == null) ? "X" : String(n.sex);
+
+    card.innerHTML = `
+      <div class="k">Referencia RMSSD</div>
+      <div class="v">${n.rmssd_state || "—"}</div>
+      <div class="u">Edad: ${age} • Sexo: ${sex} • Bajo &lt; ${low!=null?low.toFixed(0):"—"} ms • Normal ${low!=null?low.toFixed(0):"—"}–${high!=null?high.toFixed(0):"—"} ms • Alto &gt; ${high!=null?high.toFixed(0):"—"} ms</div>
     `;
-    normsBody.appendChild(tr);
+    normsEl.appendChild(card);
   }
 
-  // Semáforo
-  const sem = dash.semaphore || {};
-  const color = sem.color || "gris";
-  if(colorEl) colorEl.textContent = color;
-  if(box) box.style.borderColor = _semBorder(color);
+  // ---------- Semáforo ----------
+  const semEl = document.getElementById("semaforoCards");
+  if(semEl){
+    semEl.innerHTML = "";
+    const sem = dash.semaphore || {};
+    const color = String(sem.color || "gris").toLowerCase();
 
-  if(planBody){
-    planBody.innerHTML = "";
+    let cls = "card";
+    if(color === "verde") cls += " good";
+    else if(color === "amarillo") cls += " warn";
+    else if(color === "rojo") cls += " bad";
+
+    const head = document.createElement("div");
+    head.className = cls;
+    head.innerHTML = `
+      <div class="k">Semáforo</div>
+      <div class="v">${sem.color || "—"}</div>
+      <div class="u">${dash.differentiator?.what_distinguishes || ""}</div>
+    `;
+    semEl.appendChild(head);
+
     (sem.plan || []).forEach(p => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06);">${p.item || ""}</td>
-        <td style="padding:8px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:ui-monospace, Menlo, monospace;">${p.pct ?? "—"}%</td>
+      const c = document.createElement("div");
+      c.className = "card";
+      c.innerHTML = `
+        <div class="k">${p.item || ""}</div>
+        <div class="v">${p.pct ?? "—"}%</div>
+        <div class="u"></div>
       `;
-      planBody.appendChild(tr);
+      semEl.appendChild(c);
     });
-  }
-
-  if(diffEl){
-    diffEl.textContent = dash.differentiator?.what_distinguishes || "";
   }
 }
