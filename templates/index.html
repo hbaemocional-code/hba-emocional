@@ -74,8 +74,8 @@
         <div class="mediaRow">
           <div class="mediaCard glass neon">
             <div class="mediaHeader">
-              <div class="mediaTitle">Cámara PPG</div>
-              <div class="mediaSub">Colocá el dedo firme sobre el lente</div>
+              <div class="mediaTitle" id="mediaTitle">Cámara PPG</div>
+              <div class="mediaSub" id="mediaSub">Colocá el dedo firme sobre el lente</div>
             </div>
 
             <div class="videoFrame">
@@ -83,24 +83,11 @@
               <canvas id="frameCanvas" class="frameCanvas"></canvas>
               <div class="videoOverlay">
                 <div class="reticle"></div>
-                <div class="reticleText">Mantener estable</div>
+                <div class="reticleText" id="reticleText">Mantener estable</div>
               </div>
             </div>
 
-            <div class="tinyNote">Consejo: apoyá el codo, evitá movimiento, cubrí bien el lente.</div>
-
-            <!-- NUEVO: rPPG rostro (piloto) - video oculto/mini para stream -->
-            <video
-              id="faceVideo"
-              playsinline
-              autoplay
-              muted
-              style="width:1px;height:1px;opacity:0;position:absolute;left:-9999px;top:-9999px;"
-            ></video>
-            <canvas
-              id="faceCanvas"
-              style="width:1px;height:1px;opacity:0;position:absolute;left:-9999px;top:-9999px;"
-            ></canvas>
+            <div class="tinyNote" id="mediaNote">Consejo: apoyá el codo, evitá movimiento, cubrí bien el lente.</div>
           </div>
 
           <!-- CONTROLS -->
@@ -114,22 +101,28 @@
               <div class="field">
                 <div class="fieldLabel">Sensor</div>
                 <select id="sensorType" class="select">
-                  <option value="camera_ppg">Cámara (PPG)</option>
+                  <option value="camera_ppg">Cámara (Dedo PPG)</option>
+                  <option value="face_rppg">Cámara (Rostro rPPG • 1 min)</option>
+                  <option value="vibration_scg">Vibración (Acelerómetro SCG • 1 min)</option>
                   <option value="polar_h10">Polar H10 (BLE)</option>
+                  <option value="rr_upload">RR por Archivo (CSV/JSON)</option>
                 </select>
-                <div class="tinyNote">Polar H10 requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost.</div>
+                <div class="tinyNote" id="sensorHint">
+                  Polar H10 requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost.
+                </div>
               </div>
 
               <div class="field">
                 <div class="fieldLabel">Duración</div>
                 <div class="segmented">
+                  <button class="segBtn" data-min="1" id="dur1" style="display:none;">1 min</button>
                   <button class="segBtn active" data-min="3" id="dur3">3 min</button>
                   <button class="segBtn" data-min="5" id="dur5">5 min</button>
                 </div>
-                <div class="tinyNote">5 min recomendado para espectral (LF/HF) más estable.</div>
+                <div class="tinyNote" id="durHint">5 min recomendado para espectral (LF/HF) más estable.</div>
               </div>
 
-              <div class="field" style="grid-column: 1 / -1;">
+              <div class="field" id="torchField" style="grid-column: 1 / -1;">
                 <div class="fieldLabel">Flash (Torch)</div>
                 <label style="display:flex; align-items:center; gap:10px; font-weight:900;">
                   <input id="torchToggle" type="checkbox" checked />
@@ -137,74 +130,32 @@
                 </label>
                 <div class="tinyNote">Si el flash quema y aplana la onda, desactivá. Si está oscuro, activá.</div>
               </div>
+
+              <!-- RR upload -->
+              <div class="field" id="rrUploadField" style="grid-column: 1 / -1; display:none;">
+                <div class="fieldLabel">Cargar RR (CSV/JSON)</div>
+                <input id="rrFile" class="input" type="file" accept=".csv,.json,application/json,text/csv" />
+                <div class="tinyNote" id="rrUploadHint">
+                  CSV: una columna con RR en ms (o segundos). JSON: {"rri_ms":[...]} o [..].
+                </div>
+              </div>
+
+              <!-- Guía -->
+              <div class="field" id="guideField" style="grid-column: 1 / -1;">
+                <div class="fieldLabel">Guía</div>
+                <div class="glass neon" style="padding:12px;">
+                  <div id="guideText" class="panelHint" style="margin:0;">
+                    Elegí un sensor y presioná Iniciar.
+                  </div>
+                </div>
+              </div>
             </div>
 
-            <!-- EXISTENTE -->
             <div class="actionRow">
               <button class="btn btnPrimary" id="btnStart">Iniciar</button>
               <button class="btn btnDanger" id="btnStop" disabled>Detener</button>
               <button class="btn btnAccent" id="btnSave" disabled>Guardar</button>
             </div>
-
-            <!-- ===================== -->
-            <!-- NUEVO: HERRAMIENTAS   -->
-            <!-- ===================== -->
-            <div class="divider"></div>
-
-            <!-- Vibración (SCG) -->
-            <div class="field">
-              <div class="fieldLabel">Vibración (SCG)</div>
-              <div class="tinyNote">Usa acelerómetro (DeviceMotion). En iOS pide permiso al iniciar.</div>
-              <div class="actionRow">
-                <button class="btn btnPrimary" id="btnVibrationStart">Iniciar Captura por Vibración</button>
-                <button class="btn btnDanger" id="btnVibrationStop" disabled>Detener Vibración</button>
-                <button class="btn btnAccent" id="btnVibrationSend" disabled>Procesar Vibración</button>
-              </div>
-            </div>
-
-            <div class="divider"></div>
-
-            <!-- Rostro (rPPG) -->
-            <div class="field">
-              <div class="fieldLabel">Rostro (rPPG) • Piloto</div>
-              <div class="tinyNote">Activa stream de cámara frontal y estima HRV de forma liviana.</div>
-              <div class="actionRow">
-                <button class="btn btnPrimary" id="btnFaceStart">Iniciar Rostro (rPPG)</button>
-                <button class="btn btnDanger" id="btnFaceStop" disabled>Detener Rostro</button>
-                <button class="btn btnAccent" id="btnFaceSend" disabled>Procesar Rostro</button>
-              </div>
-            </div>
-
-            <div class="divider"></div>
-
-            <!-- Pulsera RR genérico -->
-            <div class="field">
-              <div class="fieldLabel">Pulsera / RR genérico</div>
-              <div class="tinyNote">Conectar por BLE (RR) o importar RR (CSV/JSON) estilo Kubios.</div>
-
-              <div class="actionRow" style="grid-template-columns: 1fr 1fr 1fr;">
-                <button class="btn btnPrimary" id="btnBraceletConnect">Conectar Pulsera (BLE RR)</button>
-                <button class="btn btnDanger" id="btnBraceletDisconnect" disabled>Desconectar</button>
-                <button class="btn btnAccent" id="btnBraceletUseRR" disabled>Usar RR</button>
-              </div>
-
-              <div class="divider"></div>
-
-              <div class="twoCols">
-                <div class="field">
-                  <div class="fieldLabel">Importar RR (CSV/JSON)</div>
-                  <input id="rrFile" class="input" type="file" accept=".csv,.json,application/json,text/csv" />
-                  <div class="tinyNote">CSV: una columna RR(ms) o JSON: { "rri_ms": [..] }</div>
-                </div>
-
-                <div class="field" style="align-items:stretch;">
-                  <div class="fieldLabel">Acción</div>
-                  <button class="btn btnAccent" id="btnRRImport" disabled>Importar y Calcular</button>
-                  <div class="tinyNote">Se calcula con el mismo pipeline que Polar.</div>
-                </div>
-              </div>
-            </div>
-
           </div>
         </div>
       </section>
@@ -260,7 +211,7 @@
           <div class="cards" id="cards"></div>
         </div>
 
-        <!-- NUEVO: Cuadro biomarcadores (alto/medio/bajo) -->
+        <!-- NUEVO: Cuadro biomarcadores -->
         <div class="results glass neon">
           <div class="resultsHeader">
             <div class="resultsTitle">Cuadro de Biomarcadores</div>
@@ -305,7 +256,19 @@
     </footer>
   </div>
 
+  <!-- Overlay countdown (sin CSS nuevo: inline) -->
+  <div id="countdownOverlay"
+       class="glass neon"
+       style="display:none; position:fixed; inset:0; z-index:9999; align-items:center; justify-content:center; padding:24px;">
+    <div class="glass neon" style="padding:22px; max-width:520px; width:min(92vw,520px); text-align:center;">
+      <div class="brandTitle" id="countdownTitle" style="margin-bottom:10px;">Preparación</div>
+      <div id="countdownText" class="panelHint" style="margin-bottom:16px;">—</div>
+      <div id="countdownNumber" style="font-size:64px; font-weight:900;">3</div>
+      <div class="tinyNote" id="countdownHint" style="margin-top:12px;">No bloquees la pantalla.</div>
+    </div>
+  </div>
+
   <!-- cache-buster -->
-  <script src="/static/js/main.js?v=4"></script>
+  <script src="/static/js/main.js?v=6"></script>
 </body>
 </html>
