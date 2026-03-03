@@ -6,6 +6,7 @@ import pandas as pd
 from flask import Flask, render_template, request, jsonify
 import neurokit2 as nk
 from scipy import interpolate
+from scipy.signal import butter, filtfilt, hilbert  # ✅ NUEVO (rostro + vibración)
 
 app = Flask(__name__)
 
@@ -383,6 +384,169 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
 
 
 # ============================
+# NUEVO: Rostro (rPPG) + Vibración (SCG)
+# (Integrado sin tocar lo que ya funciona)
+# ============================
+
+def _bandpass(x, fs, low, high, order=3):
+    x = np.asarray(x, dtype=float)
+    if x.size < 5:
+        return x
+    nyq = 0.5 * fs
+    low = max(1e-6, low / nyq)
+    high = min(0.999999, high / nyq)
+    if not (0 < low < high < 1):
+        return x
+    b, a = butter(order, [low, high], btype="band")
+    return filtfilt(b, a, x)
+
+
+def _safe_std(x):
+    s = float(np.nanstd(x))
+    return s if np.isfinite(s) and s > 1e-12 else 1e-12
+
+
+def _find_rr_from_signal(sig, fs, min_hr=40, max_hr=180):
+    """
+    Detección robusta de picos -> RR (ms)
+    """
+    sig = _finite_array(sig)
+    if sig.size < int(fs * 20):
+        return None
+
+    sig = sig - np.nanmean(sig)
+    sig = sig / _safe_std(sig)
+
+    # try NK peaks
+    peaks = np.array([], dtype=int)
+    try:
+        peaks_info = nk.signal_findpeaks(sig, sampling_rate=fs)
+        pk = peaks_info.get("Peaks", None)
+        if pk is None:
+            pk = peaks_info.get("peaks", None)
+        if pk is not None:
+            peaks = np.asarray(pk, dtype=int)
+    except Exception:
+        peaks = np.array([], dtype=int)
+
+    # fallback simple
+    if peaks.size < 8:
+        refractory = int(fs * (60.0 / max_hr))
+        peaks_list = []
+        for i in range(1, len(sig) - 1):
+            if sig[i] > sig[i - 1] and sig[i] > sig[i + 1]:
+                if not peaks_list or (i - peaks_list[-1]) >= refractory:
+                    peaks_list.append(i)
+        peaks = np.asarray(peaks_list, dtype=int)
+
+    if peaks.size < 8:
+        return None
+
+    rr_ms = np.diff(peaks) / fs * 1000.0
+    rr_ms = rr_ms[np.isfinite(rr_ms)]
+    if rr_ms.size < 8:
+        return None
+
+    rr_min = 60000.0 / max_hr
+    rr_max = 60000.0 / min_hr
+    rr_ms = rr_ms[(rr_ms >= rr_min) & (rr_ms <= rr_max)]
+    if rr_ms.size < 8:
+        return None
+
+    return rr_ms
+
+
+def compute_hrv_from_face_rgb(rgb: dict, sampling_rate: float, duration_minutes=None):
+    """
+    HRV desde rostro (rPPG) usando CHROM (de Haan):
+      rgb = {"r":[...], "g":[...], "b":[...]}
+    """
+    try:
+        fs = float(sampling_rate)
+    except Exception:
+        return {"error": "sampling_rate inválido (rostro)."}
+
+    if not np.isfinite(fs) or fs < 10:
+        return {"error": "sampling_rate inválido (rostro)."}
+
+    try:
+        r = np.asarray(rgb.get("r", []), dtype=float)
+        g = np.asarray(rgb.get("g", []), dtype=float)
+        b = np.asarray(rgb.get("b", []), dtype=float)
+    except Exception:
+        return {"error": "RGB inválido."}
+
+    n = min(len(r), len(g), len(b))
+    if n < int(fs * 45):
+        return {"error": "Señal rostro insuficiente (mínimo 45s)."}
+
+    r, g, b = r[:n], g[:n], b[:n]
+
+    r = (r - np.nanmean(r)) / _safe_std(r)
+    g = (g - np.nanmean(g)) / _safe_std(g)
+    b = (b - np.nanmean(b)) / _safe_std(b)
+
+    # CHROM
+    X = 3.0 * r - 2.0 * g
+    Y = 1.5 * r + 1.0 * g - 1.5 * b
+    alpha = _safe_std(X) / _safe_std(Y)
+    s = X - alpha * Y
+
+    # Banda cardiaca
+    s = _bandpass(s, fs, 0.7, 4.0, order=3)
+
+    rr_ms = _find_rr_from_signal(s, fs, min_hr=40, max_hr=180)
+    if rr_ms is None or rr_ms.size < 12:
+        return {"error": "No se pudieron extraer RR confiables desde rostro."}
+
+    rr_clean, artifact_percent, _mask = clean_rri_ms(rr_ms)
+    result = compute_hrv_from_rri(rr_clean, duration_minutes=duration_minutes)
+    result["artifact_percent"] = artifact_percent
+    result["n_rr"] = int(len(rr_clean))
+    result["sampling_rate"] = float(fs)
+    return result
+
+
+def compute_hrv_from_vibration_scg(acc_z, sampling_rate: float, duration_minutes=None):
+    """
+    HRV desde vibración (SCG):
+      - bandpass 5–25 Hz
+      - envolvente (Hilbert)
+      - picos -> RR
+    """
+    try:
+        fs = float(sampling_rate)
+    except Exception:
+        return {"error": "sampling_rate inválido (vibración)."}
+
+    if not np.isfinite(fs) or fs < 20:
+        return {"error": "sampling_rate inválido (vibración)."}
+
+    z = _finite_array(np.asarray(acc_z, dtype=float))
+    if z.size < int(fs * 45):
+        return {"error": "Señal vibración insuficiente (mínimo 45s)."}
+
+    zf = _bandpass(z, fs, 5.0, 25.0, order=3)
+
+    env = np.abs(hilbert(zf))
+    env = env - np.nanmean(env)
+    env = env / _safe_std(env)
+
+    env = _bandpass(env, fs, 0.7, 4.0, order=2)
+
+    rr_ms = _find_rr_from_signal(env, fs, min_hr=40, max_hr=180)
+    if rr_ms is None or rr_ms.size < 12:
+        return {"error": "No se pudieron extraer RR confiables desde vibración."}
+
+    rr_clean, artifact_percent, _mask = clean_rri_ms(rr_ms)
+    result = compute_hrv_from_rri(rr_clean, duration_minutes=duration_minutes)
+    result["artifact_percent"] = artifact_percent
+    result["n_rr"] = int(len(rr_clean))
+    result["sampling_rate"] = float(fs)
+    return result
+
+
+# ============================
 # HBA Dashboard (CUADROS + SEMÁFORO)
 # ============================
 
@@ -588,6 +752,12 @@ def enrich_hba_dashboard(result: dict, payload: dict):
         except Exception:
             pass
 
+    # ✅ NUEVO: Rostro (face_rppg) - Baevsky desde RR que ya viene implícito (usamos RMSSD/SDNN/HR ya calculados)
+    # (Baevsky requiere RR; si querés Baevsky real acá, hay que enviar RR o señal al backend.
+    #  Por ahora NO inventamos Baevsky: queda NaN y no rompe nada.)
+
+    # ✅ NUEVO: Vibración (vibration_scg) - idem: Baevsky solo si tuviéramos RR explícito aparte.
+
     # Normas RMSSD por edad/sexo
     rm_low, rm_high = rmssd_reference_by_age_sex(age, sex)
     rm_state = classify_hml(rmssd, rm_low, rm_high)
@@ -720,7 +890,27 @@ def api_compute():
         result = enrich_hba_dashboard(result, payload)
         return jsonify(_sanitize_for_json(result))
 
-    return jsonify(_sanitize_for_json({"error": "sensor_type inválido. Use 'camera_ppg' o 'polar_h10'."})), 400
+    # ✅ NUEVO: Rostro rPPG (RGB por ROI)
+    if sensor_type == "face_rppg":
+        rgb = payload.get("rgb", {}) or {}
+        sampling_rate = payload.get("sampling_rate", 30)
+        result = compute_hrv_from_face_rgb(rgb, float(sampling_rate), duration_minutes=duration_minutes)
+        result["sensor_type"] = "face_rppg"
+        result["duration_minutes"] = duration_minutes
+        result = enrich_hba_dashboard(result, payload)
+        return jsonify(_sanitize_for_json(result))
+
+    # ✅ NUEVO: Vibración SCG (acelerómetro Z)
+    if sensor_type == "vibration_scg":
+        acc_z = payload.get("acc_z", []) or []
+        sampling_rate = payload.get("sampling_rate", 100)
+        result = compute_hrv_from_vibration_scg(acc_z, float(sampling_rate), duration_minutes=duration_minutes)
+        result["sensor_type"] = "vibration_scg"
+        result["duration_minutes"] = duration_minutes
+        result = enrich_hba_dashboard(result, payload)
+        return jsonify(_sanitize_for_json(result))
+
+    return jsonify(_sanitize_for_json({"error": "sensor_type inválido. Use 'camera_ppg', 'polar_h10', 'face_rppg' o 'vibration_scg'."})), 400
 
 
 @app.route("/api/save", methods=["POST"])
