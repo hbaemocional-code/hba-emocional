@@ -1,1801 +1,808 @@
-/* static/js/main.js  (REEMPLAZAR COMPLETO)
-   Mantiene:
-   - /api/compute y /api/save
-   - Polar BLE
-   - Cámara dedo PPG (AC-only + rAF scheduler)
-   Agrega (SIN ROMPER UI / SIN TOCAR CSS):
-   - Sensor: Rostro rPPG (1 min) (FaceDetector si existe + fallback ROI centrado)
-   - Sensor: Vibración SCG (1 min) (DeviceMotionEvent iOS/Android)
-   - Sensor: RR por archivo (CSV/JSON) estilo Kubios
-   - Guía + countdown + wake lock + beep final
-*/
+/* ═══════════════════════════════════════════════════════════════
+   HBA v2.0 — main.js
+   Sensores: cámara PPG · rPPG facial · vibración SCG ·
+             Polar H10 BLE · importación CSV/JSON RR
+   Dashboard: semáforo clínico · cargas diferenciadas ·
+              biomarcadores · Poincaré · plan de intervención
+═══════════════════════════════════════════════════════════════ */
 
-let selectedDurationMin = 3;
-let measuring = false;
-let sensorType = "camera_ppg";
+"use strict";
 
-let timerInterval = null;
-let startedAt = null;
+// ── Constantes ───────────────────────────────────────────────────
+const PPG_SR   = 30;          // muestras/s (cámara PPG / rPPG)
+const SCG_SR   = 50;          // muestras/s (acelerómetro)
+const SIGNAL_WIN = 300;       // puntos visibles en la gráfica
+const CHART_FPS  = 10;        // fps máximo del gráfico
 
-// Cámara (reuso del mismo video/canvas)
-let mediaStream = null;
-let videoEl = null;
-let frameCanvas = null;
-let frameCtx = null;
-
-let ppgSamples = [];
-let ppgTimestamps = [];
-
-let targetFps = 30;
-let rafId = null;
-
-// Torch (solo dedo)
-let trackRef = null;
-let torchAvailable = false;
-let torchEnabled = false;
-let torchMode = "auto"; // "auto" | "off"
-
-// Polar H10 BLE
-let bleDevice = null;
-let bleChar = null;
-let rrIntervalsMs = [];
-let lastMetrics = null;
-
-// Vibración
-let motionListening = false;
-let vibSamples = [];
-let vibTimestamps = [];
-let vibLastGravity = {x:0,y:0,z:0};
-
-// Wake lock
-let wakeLockSentinel = null;
-
-// Chart.js
-let chart = null;
-
-/* ========================= UI helpers ========================= */
-function setStatus(text, level="idle"){
-  const dot = document.getElementById("statusDot");
-  const label = document.getElementById("statusText");
-  if(!dot || !label) return;
-
-  label.textContent = text;
-
-  if(level === "ok"){
-    dot.style.background = "var(--ok)";
-    dot.style.boxShadow = "0 0 0 4px rgba(52,211,153,0.16)";
-  } else if(level === "warn"){
-    dot.style.background = "var(--warn)";
-    dot.style.boxShadow = "0 0 0 4px rgba(251,191,36,0.16)";
-  } else if(level === "bad"){
-    dot.style.background = "var(--bad)";
-    dot.style.boxShadow = "0 0 0 4px rgba(251,113,133,0.16)";
-  } else {
-    dot.style.background = "var(--muted)";
-    dot.style.boxShadow = "0 0 0 4px rgba(149,163,183,0.12)";
-  }
-}
-
-function setGuide(text){
-  const el = document.getElementById("guideText");
-  if(el) el.textContent = text;
-}
-
-function fmtTime(sec){
-  const m = String(Math.floor(sec/60)).padStart(2,"0");
-  const s = String(sec%60).padStart(2,"0");
-  return `${m}:${s}`;
-}
-
-function setTimerText(){
-  const chipTimer = document.getElementById("chipTimer");
-  if(!chipTimer) return;
-  if(!measuring || !startedAt){
-    chipTimer.textContent = "00:00";
-    return;
-  }
-  const elapsedSec = Math.floor((Date.now() - startedAt)/1000);
-  chipTimer.textContent = fmtTime(elapsedSec);
-}
-
-function setSensorChip(){
-  const chip = document.getElementById("chipSensor");
-  if(!chip) return;
-
-  const map = {
-    camera_ppg: "Sensor: Cámara (Dedo PPG)",
-    face_rppg: "Sensor: Cámara (Rostro rPPG)",
-    vibration_scg: "Sensor: Vibración (SCG)",
-    polar_h10: "Sensor: Polar H10 (BLE)",
-    rr_upload: "Sensor: RR por Archivo"
-  };
-  chip.textContent = map[sensorType] || "Sensor";
-}
-
-function enableControls(){
-  const s = document.getElementById("btnStart");
-  const t = document.getElementById("btnStop");
-  const v = document.getElementById("btnSave");
-  if(s) s.disabled = measuring;
-  if(t) t.disabled = !measuring;
-  if(v) v.disabled = measuring || !lastMetrics || !!lastMetrics.error;
-}
-
-/* ========================= Sonido (beep) ========================= */
-function beep(ms=200, freq=880){
-  try{
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.type = "sine";
-    o.frequency.value = freq;
-    g.gain.value = 0.08;
-    o.connect(g);
-    g.connect(ctx.destination);
-    o.start();
-    setTimeout(() => {
-      o.stop();
-      ctx.close();
-    }, ms);
-  }catch(_e){}
-}
-
-/* ========================= Wake Lock ========================= */
-async function acquireWakeLock(){
-  try{
-    if("wakeLock" in navigator){
-      wakeLockSentinel = await navigator.wakeLock.request("screen");
-      wakeLockSentinel.addEventListener("release", () => {});
-    } else {
-      // no disponible, avisamos suave
-    }
-  }catch(_e){}
-}
-async function releaseWakeLock(){
-  try{
-    if(wakeLockSentinel){
-      await wakeLockSentinel.release();
-      wakeLockSentinel = null;
-    }
-  }catch(_e){}
-}
-
-/* ========================= Countdown Overlay ========================= */
-async function runCountdown({title, text, hint, seconds=3}){
-  const ov = document.getElementById("countdownOverlay");
-  const t = document.getElementById("countdownTitle");
-  const tx = document.getElementById("countdownText");
-  const n = document.getElementById("countdownNumber");
-  const h = document.getElementById("countdownHint");
-
-  if(!ov || !t || !tx || !n || !h) return;
-
-  t.textContent = title || "Preparación";
-  tx.textContent = text || "—";
-  h.textContent = hint || "—";
-
-  ov.style.display = "flex";
-
-  for(let i=seconds; i>=1; i--){
-    n.textContent = String(i);
-    beep(80, 740);
-    await new Promise(r => setTimeout(r, 900));
-  }
-
-  n.textContent = "¡YA!";
-  beep(160, 990);
-  await new Promise(r => setTimeout(r, 350));
-
-  ov.style.display = "none";
-}
-
-/* ========================= Calidad ========================= */
-function setQuality(score){
-  const fill = document.getElementById("qualityFill");
-  const txt = document.getElementById("qualityText");
-  if(!fill || !txt) return;
-
-  if(score == null || !Number.isFinite(score)){
-    fill.style.width = "0%";
-    txt.textContent = "—";
-    return;
-  }
-  const s = Math.max(0, Math.min(100, score));
-  fill.style.width = `${s.toFixed(0)}%`;
-  if(s >= 70) txt.textContent = "Alta";
-  else if(s >= 40) txt.textContent = "Media";
-  else txt.textContent = "Baja";
-}
-
-/* ========================= Chart ECG ========================= */
-const glowPlugin = {
-  id: "ecgGlow",
-  beforeDatasetDraw(chart){
-    const ctx = chart.ctx;
-    ctx.save();
-    ctx.shadowColor = "rgba(255,43,43,0.45)";
-    ctx.shadowBlur = 10;
-  },
-  afterDatasetDraw(chart){
-    chart.ctx.restore();
-  }
+// ── Estado global ────────────────────────────────────────────────
+const G = {
+  sensor        : "camera_ppg",
+  durationMin   : 3,
+  running       : false,
+  ppgBuffer     : [],      // muestras raw PPG/SCG
+  rrBuffer      : [],      // intervalos RR en ms (Polar / upload)
+  signalBuffer  : [],      // para la gráfica en tiempo real
+  totalSeconds  : 0,
+  elapsedSec    : 0,
+  lastMetrics   : null,
+  quality       : null,    // 0-100
+  // handles
+  timerHandle   : null,
+  rafHandle     : null,
+  chartLastDraw : 0,
+  // BLE Polar
+  bleDevice     : null,
+  bleServer     : null,
+  // Media streams
+  stream        : null,
+  videoEl       : null,
+  frameCtx      : null,
+  // Sensor motion
+  motionHandler : null,
+  motionBuffer  : [],
 };
 
-function initChart(){
-  const canvas = document.getElementById("signalChart");
-  if(!canvas) return;
+// ── Refs DOM ─────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
 
-  chart = new Chart(canvas, {
+// ── Gráfica señal (Chart.js) ─────────────────────────────────────
+let signalChart = null;
+
+function buildChart() {
+  const ctx = $("signalChart").getContext("2d");
+  signalChart = new Chart(ctx, {
     type: "line",
     data: {
-      labels: [],
+      labels: Array(SIGNAL_WIN).fill(""),
       datasets: [{
-        label: "Señal",
-        data: [],
-        pointRadius: 0,
-        borderWidth: 3,
-        tension: 0.18,
-        borderColor: "#ff2b2b"
+        data           : Array(SIGNAL_WIN).fill(null),
+        borderColor    : "rgba(29,78,216,0.85)",
+        borderWidth    : 1.5,
+        pointRadius    : 0,
+        fill           : true,
+        backgroundColor: "rgba(29,78,216,0.06)",
+        tension        : 0.3,
       }]
     },
     options: {
-      responsive: true,
+      animation       : false,
+      responsive      : true,
       maintainAspectRatio: false,
-      animation: false,
-      plugins: { legend: { display: false } },
-      scales: { x: { display: false }, y: { display: false } }
-    },
-    plugins: [glowPlugin]
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: {
+        x: { display: false },
+        y: { display: false, grace: "20%" }
+      }
+    }
   });
 }
 
-function pushChartPoint(value){
-  if(!chart) return;
-  const maxPoints = 320;
-  chart.data.labels.push("");
-  chart.data.datasets[0].data.push(value);
-  if(chart.data.labels.length > maxPoints){
-    chart.data.labels.shift();
-    chart.data.datasets[0].data.shift();
-  }
-  chart.update("none");
+function pushSignal(val) {
+  G.signalBuffer.push(val);
+  if (G.signalBuffer.length > SIGNAL_WIN * 3) G.signalBuffer.shift();
 }
 
-/* ========================= UI setup ========================= */
-function setupDurationButtons(){
-  const b1 = document.getElementById("dur1");
-  const b3 = document.getElementById("dur3");
-  const b5 = document.getElementById("dur5");
-  if(!b3 || !b5) return;
+function renderChart(now) {
+  G.rafHandle = requestAnimationFrame(renderChart);
+  if (!G.running) return;
+  if (now - G.chartLastDraw < 1000 / CHART_FPS) return;
+  G.chartLastDraw = now;
 
-  function setActive(min){
-    selectedDurationMin = min;
-    if(b1) b1.classList.toggle("active", min === 1);
-    b3.classList.toggle("active", min === 3);
-    b5.classList.toggle("active", min === 5);
-  }
+  const buf  = G.signalBuffer;
+  const data = buf.length >= SIGNAL_WIN
+    ? buf.slice(buf.length - SIGNAL_WIN)
+    : [...Array(SIGNAL_WIN - buf.length).fill(null), ...buf];
 
-  if(b1) b1.addEventListener("click", () => setActive(1));
-  b3.addEventListener("click", () => setActive(3));
-  b5.addEventListener("click", () => setActive(5));
+  signalChart.data.datasets[0].data = data;
+  signalChart.update("none");
 }
 
-function updateUIForSensor(){
-  // hints
-  const sensorHint = document.getElementById("sensorHint");
-  const durHint = document.getElementById("durHint");
-  const torchField = document.getElementById("torchField");
-  const rrUploadField = document.getElementById("rrUploadField");
+// ── Timer ────────────────────────────────────────────────────────
+function startTimer() {
+  G.elapsedSec = 0;
+  G.timerHandle = setInterval(() => {
+    G.elapsedSec++;
+    const m = String(Math.floor(G.elapsedSec / 60)).padStart(2, "0");
+    const s = String(G.elapsedSec % 60).padStart(2, "0");
+    $("chipTimer").textContent = `${m}:${s}`;
 
-  const b1 = document.getElementById("dur1");
-  const b3 = document.getElementById("dur3");
-  const b5 = document.getElementById("dur5");
-
-  // media labels
-  const mediaTitle = document.getElementById("mediaTitle");
-  const mediaSub = document.getElementById("mediaSub");
-  const mediaNote = document.getElementById("mediaNote");
-  const reticleText = document.getElementById("reticleText");
-
-  function show1min(yes){
-    if(b1) b1.style.display = yes ? "inline-flex" : "none";
-  }
-
-  if(sensorType === "camera_ppg"){
-    if(sensorHint) sensorHint.textContent = "Dedo firme sobre lente. Ideal cámara trasera. Torch AUTO disponible si el dispositivo lo soporta.";
-    if(durHint) durHint.textContent = "5 min recomendado para espectral (LF/HF) más estable.";
-    if(torchField) torchField.style.display = "";
-    if(rrUploadField) rrUploadField.style.display = "none";
-    show1min(false);
-
-    if(mediaTitle) mediaTitle.textContent = "Cámara PPG (Dedo)";
-    if(mediaSub) mediaSub.textContent = "Colocá el dedo firme sobre el lente";
-    if(reticleText) reticleText.textContent = "Mantener estable";
-    if(mediaNote) mediaNote.textContent = "Consejo: apoyá el codo, evitá movimiento, cubrí bien el lente.";
-
-    setGuide("Dedo firme, presión constante (sin apretar de más). Iluminación estable. Si cambia a rojo saturado, aflojá un poco.");
-    // duration default to 3/5
-    if(selectedDurationMin === 1) selectedDurationMin = 3;
-    if(b3) b3.classList.add("active");
-    if(b5) b5.classList.remove("active");
-  }
-  else if(sensorType === "face_rppg"){
-    if(sensorHint) sensorHint.textContent = "Rostro rPPG: 1 minuto. Recomendado buena luz frontal, sin movimiento.";
-    if(durHint) durHint.textContent = "Rostro usa 1 min fijo.";
-    if(torchField) torchField.style.display = "none";
-    if(rrUploadField) rrUploadField.style.display = "none";
-    show1min(true);
-
-    selectedDurationMin = 1;
-    if(b1) b1.classList.add("active");
-    if(b3) b3.classList.remove("active");
-    if(b5) b5.classList.remove("active");
-
-    if(mediaTitle) mediaTitle.textContent = "Cámara (Rostro rPPG)";
-    if(mediaSub) mediaSub.textContent = "Mirada al frente • luz pareja • sin hablar";
-    if(reticleText) reticleText.textContent = "Rostro centrado";
-    if(mediaNote) mediaNote.textContent = "Consejo: sentate, apoyá espalda, respiración tranquila. Evitá mover cabeza y cejas.";
-    setGuide("Rostro: buena luz frontal (no contraluz). No hables. No muevas la cabeza. Respiración natural.");
-  }
-  else if(sensorType === "vibration_scg"){
-    if(sensorHint) sensorHint.textContent = "Vibración SCG: 1 minuto. Apoyá el celular en el esternón o pecho (según protocolo).";
-    if(durHint) durHint.textContent = "Vibración usa 1 min fijo.";
-    if(torchField) torchField.style.display = "none";
-    if(rrUploadField) rrUploadField.style.display = "none";
-    show1min(true);
-
-    selectedDurationMin = 1;
-    if(b1) b1.classList.add("active");
-    if(b3) b3.classList.remove("active");
-    if(b5) b5.classList.remove("active");
-
-    if(mediaTitle) mediaTitle.textContent = "Vibración (SCG)";
-    if(mediaSub) mediaSub.textContent = "Celular estable • sin hablar • respiración suave";
-    if(reticleText) reticleText.textContent = "Sin movimiento";
-    if(mediaNote) mediaNote.textContent = "Consejo: apoyá el celular firme. Evitá toser, hablar o moverte durante el minuto.";
-    setGuide("Vibración: sentate cómodo. Apoyá el celular firme (sin mano temblando). No hables. Respirá suave.");
-  }
-  else if(sensorType === "polar_h10"){
-    if(sensorHint) sensorHint.textContent = "Polar H10 requiere Web Bluetooth (Chrome/Edge) y HTTPS o localhost.";
-    if(durHint) durHint.textContent = "5 min recomendado para espectral (LF/HF) más estable.";
-    if(torchField) torchField.style.display = "none";
-    if(rrUploadField) rrUploadField.style.display = "none";
-    show1min(false);
-
-    if(mediaTitle) mediaTitle.textContent = "Polar H10 (BLE)";
-    if(mediaSub) mediaSub.textContent = "Conectá la banda y quedate quieto";
-    if(reticleText) reticleText.textContent = "Estable";
-    if(mediaNote) mediaNote.textContent = "Consejo: postura estable. No hables ni te muevas. Señal RR limpia = HRV mejor.";
-    setGuide("Polar: colocación correcta de banda y humedad en electrodos. Quedate quieto durante toda la medición.");
-    if(selectedDurationMin === 1) selectedDurationMin = 3;
-  }
-  else if(sensorType === "rr_upload"){
-    if(sensorHint) sensorHint.textContent = "Subí RR (ms) desde archivo. Luego se calcula HRV igual que Kubios (sin streaming).";
-    if(durHint) durHint.textContent = "La duración se infiere del total de RR.";
-    if(torchField) torchField.style.display = "none";
-    if(rrUploadField) rrUploadField.style.display = "";
-    show1min(false);
-
-    if(mediaTitle) mediaTitle.textContent = "RR por Archivo";
-    if(mediaSub) mediaSub.textContent = "Cargá el archivo y luego Iniciar";
-    if(reticleText) reticleText.textContent = "—";
-    if(mediaNote) mediaNote.textContent = "Formato: CSV 1 columna o JSON con rri_ms.";
-    setGuide("RR por archivo: elegí un CSV/JSON. Luego presioná Iniciar para calcular HRV y dashboard.");
-    if(selectedDurationMin === 1) selectedDurationMin = 3;
-  }
-
-  setSensorChip();
-  enableControls();
-}
-
-function setupSensorSelector(){
-  const sel = document.getElementById("sensorType");
-  if(!sel) return;
-  sel.addEventListener("change", () => {
-    sensorType = sel.value;
-    setStatus("Listo", "idle");
-    updateUIForSensor();
-  });
-}
-
-/* ========================= Cards: métricas base ========================= */
-function buildCards(metrics){
-  const cards = document.getElementById("cards");
-  const freqHint = document.getElementById("freqHint");
-  if(!cards || !freqHint) return;
-
-  cards.innerHTML = "";
-  freqHint.textContent = "";
-
-  if(!metrics){
-    const empty = document.createElement("div");
-    empty.className = "hint";
-    empty.textContent = "Aún no hay métricas calculadas.";
-    cards.appendChild(empty);
-    return;
-  }
-
-  if(metrics.freq_warning) freqHint.textContent = metrics.freq_warning;
-
-  if(metrics.error){
-    const c = document.createElement("div");
-    c.className = "card bad";
-    c.innerHTML = `<div class="k">Error</div><div class="v">${metrics.error}</div><div class="u">Revisá señal / permisos / iluminación</div>`;
-    cards.appendChild(c);
-    return;
-  }
-
-  const items = [
-    {k:"HR Media", v: metrics.hr_mean, u:"bpm"},
-    {k:"HR Máx", v: metrics.hr_max, u:"bpm"},
-    {k:"HR Mín", v: metrics.hr_min, u:"bpm"},
-    {k:"HRV (RMSSD)", v: metrics.rmssd, u:"ms"},
-    {k:"SDNN", v: metrics.sdnn, u:"ms"},
-    {k:"lnRMSSD", v: metrics.lnrmssd, u:""},
-    {k:"pNN50", v: metrics.pnn50, u:"%"},
-    {k:"Mean RR", v: metrics.mean_rr, u:"ms"},
-    {k:"LF Power", v: metrics.lf_power, u:"ms²"},
-    {k:"HF Power", v: metrics.hf_power, u:"ms²"},
-    {k:"LF/HF", v: metrics.lf_hf, u:"ratio"},
-    {k:"Total Power", v: metrics.total_power, u:"ms²"},
-    {k:"Artefactos", v: metrics.artifact_percent, u:"%"},
-    {k:"Resp (estim.)", v: metrics.resp_rate_rpm, u:"rpm"},
-  ];
-
-  items.forEach(it => {
-    const num = typeof it.v === "number" ? it.v : Number(it.v);
-    const isNum = Number.isFinite(num);
-    const val =
-      !isNum ? "—" :
-      (it.k.startsWith("HR ") ? num.toFixed(0) :
-      (it.k === "Artefactos" ? num.toFixed(1) :
-      (it.k === "Resp (estim.)" ? num.toFixed(1) : num.toFixed(3))));
-
-    let cls = "card";
-    if(it.k === "Artefactos" && isNum){
-      if(num <= 8) cls += " good";
-      else if(num <= 18) cls += " warn";
-      else cls += " bad";
+    if (G.elapsedSec >= G.totalSeconds) {
+      stopSession(true);
     }
-
-    const c = document.createElement("div");
-    c.className = cls;
-    c.innerHTML = `<div class="k">${it.k}</div><div class="v">${val}</div><div class="u">${it.u}</div>`;
-    cards.appendChild(c);
-  });
+  }, 1000);
 }
 
-/* ========================= HBA Dashboard (ya lo tenías) ========================= */
-function _stateToCardClass(state){
-  const s = String(state || "").toLowerCase();
-  if(s === "alto" || s === "ok" || s === "verde") return "good";
-  if(s === "medio" || s === "amarillo" || s === "warn") return "warn";
-  if(s === "bajo" || s === "rojo" || s === "bad") return "bad";
-  return "";
+function stopTimer() {
+  if (G.timerHandle) { clearInterval(G.timerHandle); G.timerHandle = null; }
 }
 
-function _fmtValue(v){
-  const num = (typeof v === "number") ? v : Number(v);
-  if(!Number.isFinite(num)) return "—";
-  return num.toFixed(2);
-}
-
-function buildDashTiles(metrics){
-  const grid = document.getElementById("dashGrid");
-  if(!grid) return;
-  grid.innerHTML = "";
-
-  if(!metrics || metrics.error){
-    const h = document.createElement("div");
-    h.className = "hint";
-    h.textContent = "Aún no hay métricas calculadas.";
-    grid.appendChild(h);
-    return;
-  }
-
-  const dash = metrics.hba_dashboard;
-  const rm = dash?.norms?.rmssd_state || "—";
-  const sem = dash?.semaphore?.color || "gris";
-  const art = Number(metrics.artifact_percent);
-
-  const hr = Number(metrics.hr_mean);
-  const rmssd = Number(metrics.rmssd);
-
-  const tile = document.createElement("div");
-  tile.className = "dashTile glass neon";
-  tile.innerHTML = `
-    <div class="tileTop">
-      <div class="tileName">Paciente</div>
-      <div class="tileBadge ${art<=8 ? "ok" : (art<=18 ? "warn" : "warn")}" style="${art>18 ? "border-color: rgba(251,113,133,0.22); box-shadow: 0 0 18px rgba(251,113,133,0.10);" : ""}">
-        ${metrics.error ? "Error" : "Listo"}
-      </div>
-    </div>
-
-    <div class="tileMid">
-      <div class="miniStat"><span>HR</span><strong>${Number.isFinite(hr) ? hr.toFixed(0) : "—"}</strong></div>
-      <div class="miniStat"><span>RMSSD</span><strong>${Number.isFinite(rmssd) ? rmssd.toFixed(0) : "—"}</strong></div>
-      <div class="miniStat"><span>Artef.</span><strong>${Number.isFinite(art) ? art.toFixed(0) : "—"}</strong></div>
-    </div>
-
-    <div class="miniStat" style="margin-top:2px;">
-      <span>Semáforo</span>
-      <strong style="text-transform:uppercase">${String(sem)}</strong>
-    </div>
-
-    <div class="miniStat">
-      <span>HRV estado (edad)</span>
-      <strong style="text-transform:uppercase">${String(rm)}</strong>
-    </div>
-
-    <div class="tileBar"><span class="tileBarFill" style="width:${Number.isFinite(art)? Math.max(5, Math.min(100, 100-art)) : 35}%;"></span></div>
-  `;
-  grid.appendChild(tile);
-}
-
-function buildHBADashboard(metrics){
-  const bio = document.getElementById("bioCards");
-  const meaning = document.getElementById("meaningCards");
-  const norms = document.getElementById("normsCards");
-  const sema = document.getElementById("semaforoCards");
-
-  if(bio) bio.innerHTML = "";
-  if(meaning) meaning.innerHTML = "";
-  if(norms) norms.innerHTML = "";
-  if(sema) sema.innerHTML = "";
-
-  if(!metrics || metrics.error){
-    if(bio){
-      const h = document.createElement("div");
-      h.className = "hint";
-      h.textContent = "Aún no hay biomarcadores.";
-      bio.appendChild(h);
-    }
-    return;
-  }
-
-  const dash = metrics.hba_dashboard;
-  if(!dash){
-    if(bio){
-      const h = document.createElement("div");
-      h.className = "hint";
-      h.textContent = "Dashboard HBA no disponible (backend no lo devolvió).";
-      bio.appendChild(h);
-    }
-    return;
-  }
-
-  const list = Array.isArray(dash.biomarkers) ? dash.biomarkers : [];
-  if(bio){
-    if(!list.length){
-      const h = document.createElement("div");
-      h.className = "hint";
-      h.textContent = "No hay biomarcadores para mostrar.";
-      bio.appendChild(h);
-    } else {
-      list.forEach(bm => {
-        const cls = _stateToCardClass(bm.state);
-        const c = document.createElement("div");
-        c.className = `card ${cls}`;
-        const val = _fmtValue(bm.value);
-        const unit = bm.unit ? String(bm.unit) : "";
-        const st = bm.state ? String(bm.state).toUpperCase() : "—";
-        const detail = bm.detail ? String(bm.detail) : "";
-
-        c.innerHTML = `
-          <div class="k">${bm.name}</div>
-          <div class="v">${val}</div>
-          <div class="u">${unit} • Estado: <b>${st}</b>${detail ? " • " + detail : ""}</div>
-        `;
-        bio.appendChild(c);
-      });
-    }
-  }
-
-  const meanings = Array.isArray(dash.interpretation) ? dash.interpretation : [];
-  if(meaning){
-    if(!meanings.length){
-      const h = document.createElement("div");
-      h.className = "hint";
-      h.textContent = "Sin definiciones.";
-      meaning.appendChild(h);
-    } else {
-      meanings.forEach(m => {
-        const c = document.createElement("div");
-        c.className = "card";
-        c.innerHTML = `
-          <div class="k">${m.biomarker}</div>
-          <div class="v" style="font-size: clamp(16px, 1.8vw, 20px);">Guía</div>
-          <div class="u">${m.meaning}</div>
-        `;
-        meaning.appendChild(c);
-      });
-    }
-  }
-
-  if(norms){
-    const n = dash.norms || {};
-    const low = Number(n.rmssd_low);
-    const high = Number(n.rmssd_high);
-    const state = String(n.rmssd_state || "—").toUpperCase();
-    const age = n.age ?? "—";
-    const sex = n.sex ?? "—";
-
-    const c = document.createElement("div");
-    c.className = `card ${_stateToCardClass(String(n.rmssd_state||""))}`;
-    c.innerHTML = `
-      <div class="k">Referencia RMSSD (edad/sexo)</div>
-      <div class="v">${Number.isFinite(low) ? low.toFixed(0) : "—"} – ${Number.isFinite(high) ? high.toFixed(0) : "—"}</div>
-      <div class="u">Edad: <b>${age}</b> • Sexo: <b>${sex}</b> • Estado: <b>${state}</b></div>
-    `;
-    norms.appendChild(c);
-  }
-
-  if(sema){
-    const s = dash.semaphore || {};
-    const color = String(s.color || "gris").toUpperCase();
-    const plan = Array.isArray(s.plan) ? s.plan : [];
-
-    const cls = _stateToCardClass(String(dash.norms?.rmssd_state || ""));
-    const c = document.createElement("div");
-    c.className = `card ${cls}`;
-    const itemsHtml = plan.map(p => {
-      const pct = Number(p.pct);
-      return `<div class="u" style="margin-top:6px;">• <b>${Number.isFinite(pct) ? pct : "—"}%</b> ${p.item}</div>`;
-    }).join("");
-
-    c.innerHTML = `
-      <div class="k">Semáforo HBA</div>
-      <div class="v" style="text-transform:uppercase">${color}</div>
-      <div class="u">Plan según RMSSD (edad/sexo):</div>
-      ${itemsHtml || `<div class="u">—</div>`}
-      <div class="u" style="margin-top:10px;"><b>Diferenciador:</b> ${dash.differentiator?.what_distinguishes || "Semáforo HBA"}</div>
-    `;
-    sema.appendChild(c);
-  }
-}
-
-/* ========================= Torch helpers (solo dedo) ========================= */
-function setTorchLabel(text){
-  const lbl = document.getElementById("torchLabel");
-  if(lbl) lbl.textContent = text;
-}
-function readTorchModeFromUI(){
-  const el = document.getElementById("torchToggle");
-  torchMode = (el && el.checked) ? "auto" : "off";
-  setTorchLabel(torchMode === "auto" ? "AUTO" : "OFF");
-}
-
-function torchCapable(track){
-  try{
-    const caps = track?.getCapabilities?.();
-    return !!(caps && ("torch" in caps));
-  }catch(_e){
-    return false;
-  }
-}
-
-let torchApplyInFlight = false;
-let lastTorchApplyAt = 0;
-
-function applyTorch(on){
-  if(!trackRef || !torchAvailable) return;
-  const now = Date.now();
-  if(torchApplyInFlight) return;
-  if(now - lastTorchApplyAt < 600) return;
-  torchApplyInFlight = true;
-  lastTorchApplyAt = now;
-
-  trackRef.applyConstraints({ advanced: [{ torch: !!on }] })
-    .then(() => { torchEnabled = !!on; })
-    .catch(() => {})
-    .finally(() => { torchApplyInFlight = false; });
-}
-
-/* ========================= Camera errors ========================= */
-function explainCameraPermissionError(e){
-  const name = e?.name || "";
-  if(name === "NotAllowedError" || name === "PermissionDeniedError"){
-    return "Permiso de cámara denegado. Candado (🔒) → Permitir Cámara → recargar.";
-  }
-  if(name === "NotReadableError" || name === "TrackStartError"){
-    return "Cámara ocupada/bloqueada. Cerrá otras apps que usen cámara y reintentá.";
-  }
-  if(name === "NotFoundError"){
-    return "No se encontró cámara en este dispositivo.";
-  }
-  return `Error cámara: ${e?.message || String(e)}`;
-}
-
-/* ========================= ROI channel mean ========================= */
-function meanChannelROI(img, channelIndex /*0=R,1=G,2=B*/){
-  let sum = 0;
-  for(let i=0; i<img.length; i+=4) sum += img[i + channelIndex];
-  return sum / (img.length / 4);
-}
-
-/* ========================= Robust preprocesado (reuso) ========================= */
-function replaceNonFinite(x){
-  const y = new Array(x.length);
-  let last = 0;
-  for(let i=0;i<x.length;i++){
-    const v = x[i];
-    if(Number.isFinite(v)){
-      last = v;
-      y[i] = v;
-    } else {
-      y[i] = last;
-    }
-  }
-  return y;
-}
-
-function clampByMAD(x, k=8.0){
-  const n = x.length;
-  if(n < 20) return x.slice();
-
-  const sorted = x.slice().sort((a,b)=>a-b);
-  const median = sorted[Math.floor(n/2)];
-  const absDev = x.map(v => Math.abs(v - median)).sort((a,b)=>a-b);
-  const mad = absDev[Math.floor(n/2)] || 1e-6;
-
-  const lo = median - k*mad;
-  const hi = median + k*mad;
-
-  return x.map(v => Math.min(hi, Math.max(lo, v)));
-}
-
-function movingAverage(x, w){
-  const n = x.length;
-  if(n === 0) return [];
-  const ww = Math.max(3, w|0);
-  const half = Math.floor(ww/2);
-
-  const pref = new Array(n+1);
-  pref[0]=0;
-  for(let i=0;i<n;i++) pref[i+1]=pref[i]+x[i];
-
-  const y = new Array(n);
-  for(let i=0;i<n;i++){
-    const a = Math.max(0, i-half);
-    const b = Math.min(n-1, i+half);
-    y[i]=(pref[b+1]-pref[a])/(b-a+1);
-  }
-  return y;
-}
-
-function detrendMovingAverage(x, fs, winSec = 1.5){
-  const n = x.length;
-  if(n < 20) return x.slice();
-  const w = Math.max(5, Math.floor(fs * winSec));
-  const trend = movingAverage(x, w);
-  const y = new Array(n);
-  for(let i=0;i<n;i++) y[i]=x[i]-trend[i];
-  return y;
-}
-
-function iirHighPass(x, fs, cutoffHz){
-  const dt = 1 / fs;
-  const rc = 1 / (2 * Math.PI * cutoffHz);
-  const alpha = rc / (rc + dt);
-  const y = new Array(x.length);
-  y[0] = 0;
-  for(let i=1;i<x.length;i++){
-    y[i] = alpha * (y[i-1] + x[i] - x[i-1]);
-  }
-  return y;
-}
-
-function iirLowPass(x, fs, cutoffHz){
-  const dt = 1 / fs;
-  const rc = 1 / (2 * Math.PI * cutoffHz);
-  const alpha = dt / (rc + dt);
-  const y = new Array(x.length);
-  y[0] = x[0];
-  for(let i=1;i<x.length;i++){
-    y[i] = y[i-1] + alpha * (x[i] - y[i-1]);
-  }
-  return y;
-}
-
-function winsorize(x, zLim = 4.5){
-  const n = x.length;
-  if(n < 10) return x.slice();
-  let m = 0;
-  for(const v of x) m += v;
-  m /= n;
-  let v2 = 0;
-  for(const v of x) v2 += (v - m) * (v - m);
-  const sd = Math.sqrt(v2 / n) || 1e-6;
-  const lo = m - zLim * sd;
-  const hi = m + zLim * sd;
-  return x.map(v => Math.min(hi, Math.max(lo, v)));
-}
-
-function zscore(x){
-  const n = x.length;
-  if(n < 2) return x.slice();
-  let m = 0;
-  for(const v of x) m += v;
-  m /= n;
-  let v2 = 0;
-  for(const v of x) v2 += (v - m) * (v - m);
-  const sd = Math.sqrt(v2 / n) || 1e-6;
-  return x.map(v => (v - m) / sd);
-}
-
-/* ==========================================================
-   Cámara dedo PPG (como estaba)
-========================================================== */
-async function startCameraFingerPPG(){
-  videoEl = document.getElementById("video");
-  frameCanvas = document.getElementById("frameCanvas");
-  if(!videoEl || !frameCanvas) throw new Error("Faltan elementos de cámara en el DOM.");
-
-  frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
-
-  ppgSamples = [];
-  ppgTimestamps = [];
-  setQuality(null);
-
-  setStatus("Solicitando permiso de cámara…", "warn");
-
-  try{
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: "environment" },
-        frameRate: { ideal: 30, min: 24, max: 30 },
-        width: { ideal: 640 },
-        height: { ideal: 480 }
-      },
-      audio: false
-    });
-  }catch(e){
-    throw new Error(explainCameraPermissionError(e));
-  }
-
-  videoEl.srcObject = mediaStream;
-  videoEl.playsInline = true;
-  videoEl.muted = true;
-  try { await videoEl.play(); } catch(_e) {}
-
-  const t0 = Date.now();
-  while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
-    await new Promise(r => setTimeout(r, 50));
-  }
-  if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-    throw new Error("Cámara autorizada pero sin frames. Revisá permisos y recargá.");
-  }
-
-  trackRef = mediaStream.getVideoTracks()[0];
-
-  const roiW = 50, roiH = 50;
-  frameCanvas.width = roiW;
-  frameCanvas.height = roiH;
-
-  torchAvailable = torchCapable(trackRef);
-  torchEnabled = false;
-
-  readTorchModeFromUI();
-  if(torchAvailable){
-    if(torchMode === "auto") applyTorch(true);
-    else applyTorch(false);
-  } else {
-    setTorchLabel("N/A");
-  }
-
-  setStatus("Cámara activa • recolectando PPG (dedo)", "ok");
-
-  // ---------- estados de filtro en vivo ----------
-  let baseline = null;
-  const dcAlpha = 0.01;
-
-  let hpState = 0;
-  let prevNorm = null;
-  const hpAlpha = 0.96;
-
-  let lpState = 0;
-  const lpAlpha = 0.18;
-
-  const winN = Math.round(2.5 * targetFps);
-  const buf = [];
-  const peakTimes = [];
-  let lastMsgAt = 0;
-
-  const SAT_HIGH = 242;
-  const DARK_LOW = 55;
-  let satStreak = 0;
-  let darkStreak = 0;
-
-  let prev2 = 0, prev1 = 0, cur = 0;
-  let lastPeakAt = 0;
-
-  const framePeriod = 1000 / targetFps;
-  let lastTick = performance.now();
-  let acc = 0;
-
-  const loop = (now) => {
-    if(!measuring) return;
-
-    acc += (now - lastTick);
-    lastTick = now;
-
-    let steps = 0;
-    while(acc >= framePeriod && steps < 2){
-      acc -= framePeriod;
-      steps++;
-
-      const vw = videoEl.videoWidth;
-      const vh = videoEl.videoHeight;
-
-      const sx = (vw / 2) - (roiW / 2);
-      const sy = (vh / 2) - (roiH / 2);
-
-      frameCtx.drawImage(videoEl, sx, sy, roiW, roiH, 0, 0, roiW, roiH);
-      const img = frameCtx.getImageData(0, 0, roiW, roiH).data;
-      const meanR = meanChannelROI(img, 0);
-
-      const clipped = meanR >= SAT_HIGH;
-      const tooDark = meanR <= DARK_LOW;
-
-      if(clipped){
-        satStreak++;
-        darkStreak = Math.max(0, darkStreak - 1);
-      } else if(tooDark){
-        darkStreak++;
-        satStreak = Math.max(0, satStreak - 1);
+// ── Countdown ────────────────────────────────────────────────────
+function showCountdown(title, text, hint, secs) {
+  return new Promise(resolve => {
+    const overlay = $("countdownOverlay");
+    $("countdownTitle").textContent = title;
+    $("countdownText").textContent  = text;
+    $("countdownHint").textContent  = hint;
+    overlay.style.display = "flex";
+
+    let n = secs;
+    $("countdownN").textContent = n;
+    const iv = setInterval(() => {
+      n--;
+      if (n <= 0) {
+        clearInterval(iv);
+        overlay.style.display = "none";
+        resolve();
       } else {
-        satStreak = Math.max(0, satStreak - 1);
-        darkStreak = Math.max(0, darkStreak - 1);
+        $("countdownN").textContent = n;
       }
+    }, 1000);
+  });
+}
 
-      if(torchAvailable && torchMode === "auto"){
-        if(satStreak >= 5){
-          satStreak = 0;
-          if(torchEnabled) applyTorch(false);
-        }
-        if(darkStreak >= 5){
-          darkStreak = 0;
-          if(!torchEnabled) applyTorch(true);
-        }
-      }
+// ── UI helpers ───────────────────────────────────────────────────
+function setStatus(text, cls = "") {
+  $("statusText").textContent = text;
+  const dot = $("statusDot");
+  dot.className = "status-dot";
+  if (cls) dot.classList.add(cls);
+}
 
-      if(baseline === null) baseline = meanR;
-      baseline = (1 - dcAlpha) * baseline + dcAlpha * meanR;
+function setChipSensor(text) { $("chipSensor").textContent = text; }
 
-      let acSig = meanR - baseline;
-      let norm = 0;
-      if(baseline > 12) norm = acSig / baseline;
+function setBtns(running) {
+  $("btnStart").disabled = running;
+  $("btnStop").disabled  = !running;
+  $("btnSave").disabled  = running || !G.lastMetrics;
+}
 
-      if(prevNorm === null) prevNorm = norm;
-      hpState = hpAlpha * (hpState + norm - prevNorm);
-      prevNorm = norm;
+function updateQuality(q) {
+  G.quality = q;
+  const fill = $("qualityFill");
+  const text = $("qualityText");
+  if (q == null) { fill.style.width = "0%"; text.textContent = "—"; return; }
+  fill.style.width = `${q}%`;
+  text.textContent = `${Math.round(q)}%`;
+  fill.style.background = q >= 70 ? "var(--s-optimo)" : q >= 40 ? "var(--s-comprometido)" : "var(--s-critico)";
+}
 
-      lpState = lpState + lpAlpha * (hpState - lpState);
+// ── Selector de sensor ────────────────────────────────────────────
+const SENSOR_META = {
+  camera_ppg   : { label: "Cámara PPG",    hint: "Dedo sobre lente. Cubrí bien la cámara.", dur1: false, torch: true,  media: true,  guide: "Apoyá el codo en la mesa. Colocá el dedo índice cubriendo completamente el lente y el flash. Respirá con normalidad." },
+  face_rppg    : { label: "Rostro rPPG",   hint: "Iluminación frontal constante recomendada.", dur1: true, torch: false, media: true,  guide: "Sentate frente a la cámara con luz natural o artificial estable. No te muevas durante el test." },
+  vibration_scg: { label: "Vibración SCG", hint: "Apoyá el celular sobre el esternón.", dur1: true, torch: false, media: false, guide: "Acostáte boca arriba. Colocá el celular centrado sobre el esternón. Otorgá permiso de movimiento cuando el browser lo solicite." },
+  polar_h10    : { label: "Polar H10 BLE", hint: "Requiere Chrome/Edge + HTTPS + cinta pectoral.", dur1: true, torch: false, media: false, guide: "Ajustá la cinta Polar H10 y presioná Iniciar. El browser pedirá permiso Bluetooth." },
+  rr_upload    : { label: "Importar RR",   hint: "CSV (columna 'rr' o primera columna en ms) o JSON.", dur1: true, torch: false, media: false, guide: "Cargá el archivo exportado desde Polar App, Kubios, Garmin u otro sistema HRV." },
+};
 
-      let clean = lpState;
-      if(clean > 0.06) clean = 0.06;
-      if(clean < -0.06) clean = -0.06;
+$("sensorType").addEventListener("change", () => {
+  G.sensor = $("sensorType").value;
+  const meta = SENSOR_META[G.sensor];
+  setChipSensor(meta.label);
+  $("sensorHint").textContent = meta.hint;
+  $("guideText").textContent  = meta.guide;
+  $("dur1").style.display     = meta.dur1  ? "" : "none";
+  $("torchField").style.display = meta.torch ? "" : "none";
+  $("cameraCard").style.display = meta.media ? "" : "none";
+  $("rrUploadField").style.display = G.sensor === "rr_upload" ? "" : "none";
 
-      ppgTimestamps.push(performance.now());
-      ppgSamples.push(clean);
+  if (meta.media) {
+    $("mediaTitle").textContent = G.sensor === "face_rppg" ? "Cámara facial (rPPG)" : "Cámara PPG";
+    $("mediaSub").textContent   = G.sensor === "face_rppg" ? "Iluminá tu rostro de forma uniforme" : "Colocá el dedo sobre el lente";
+    $("mediaNote").textContent  = G.sensor === "face_rppg" ? "rPPG facial: señal más ruidosa. Resultados orientativos." : "Consejo: apoyá el codo, evitá movimiento, cubrí bien el lente.";
+  }
 
-      pushChartPoint(clean * 220);
+  if (!meta.dur1 && G.durationMin === 1) {
+    $("dur3").click();
+  }
+});
 
-      buf.push(clean);
-      if(buf.length > winN) buf.shift();
+// Selector duración
+document.querySelectorAll(".seg-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".seg-btn").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    G.durationMin = parseInt(btn.dataset.min, 10);
+    G.totalSeconds = G.durationMin * 60;
+    $("durHint").textContent = G.durationMin < 5
+      ? `Test de ${G.durationMin} min: LF/HF es orientativo. Para máxima precisión usá 5 min.`
+      : "5 min: análisis espectral y DFA más estable.";
+  });
+});
 
-      prev2 = prev1;
-      prev1 = cur;
-      cur = clean;
+// Inicialización
+G.durationMin  = 3;
+G.totalSeconds = 180;
+G.sensor = "camera_ppg";
 
-      const tNow = performance.now();
-      const refractoryMs = 330;
-      if(prev1 > prev2 && prev1 > cur && (tNow - lastPeakAt) > refractoryMs){
-        let mn = Infinity, mx = -Infinity;
-        for(const v of buf){ if(v < mn) mn = v; if(v > mx) mx = v; }
-        const p2p = mx - mn;
-        if(p2p > 0.004){
-          peakTimes.push(tNow);
-          lastPeakAt = tNow;
-          while(peakTimes.length > 10) peakTimes.shift();
-        }
-      }
-
-      if(buf.length >= Math.round(1.5 * targetFps)){
-        const nowMs = Date.now();
-        if(nowMs - lastMsgAt > 350){
-          lastMsgAt = nowMs;
-
-          let mn = Infinity, mx = -Infinity;
-          for(const v of buf){ if(v < mn) mn = v; if(v > mx) mx = v; }
-          const p2p = mx - mn;
-
-          let stab = 0;
-          if(peakTimes.length >= 5){
-            const rr = [];
-            for(let i=1;i<peakTimes.length;i++) rr.push(peakTimes[i]-peakTimes[i-1]);
-            const m = rr.reduce((a,b)=>a+b,0)/rr.length;
-            let vv = 0;
-            for(const x of rr) vv += (x-m)*(x-m);
-            const sd = Math.sqrt(vv/rr.length);
-            const cv = sd / (m + 1e-6);
-            stab = 1 - Math.min(1, Math.max(0, (cv - 0.05) / 0.20));
-          } else {
-            stab = 0.15;
-          }
-
-          const ampScore = Math.max(0, Math.min(1, (p2p - 0.0035) / 0.0165));
-
-          let lightPenalty = 1.0;
-          if(clipped) lightPenalty *= 0.65;
-          if(tooDark) lightPenalty *= 0.75;
-
-          const score = 100 * lightPenalty * (0.55 * ampScore + 0.45 * stab);
-          setQuality(score);
-
-          if(clipped){
-            setStatus("Flash quema • AUTO bajará luz / aflojá presión", "warn");
-          } else if(tooDark){
-            setStatus(torchAvailable ? "Muy oscuro • AUTO prenderá flash" : "Muy oscuro • sin flash puede fallar", "warn");
-          } else if(p2p < 0.004){
-            setStatus("Señal baja • apoyá firme, sin apretar de más", "warn");
-          } else if(stab < 0.35){
-            setStatus("Señal inestable • dedo quieto y presión constante", "warn");
-          } else {
-            setStatus("Señal estable • excelente", "ok");
-          }
-        }
-      }
+// ── Cámara PPG / rPPG ─────────────────────────────────────────────
+async function startCamera() {
+  const isFace = G.sensor === "face_rppg";
+  const constraints = {
+    video: {
+      facingMode: isFace ? "user" : "environment",
+      width: { ideal: isFace ? 320 : 160 },
+      height: { ideal: isFace ? 240 : 120 },
+      frameRate: { ideal: PPG_SR },
     }
-
-    rafId = requestAnimationFrame(loop);
   };
 
-  rafId = requestAnimationFrame(loop);
-}
+  G.stream = await navigator.mediaDevices.getUserMedia(constraints);
+  G.videoEl = $("video");
+  G.videoEl.srcObject = G.stream;
+  await G.videoEl.play();
 
-async function stopCamera(){
-  if(rafId){
-    cancelAnimationFrame(rafId);
-    rafId = null;
+  const canvas = $("frameCanvas");
+  G.frameCtx = canvas.getContext("2d", { willReadFrequently: true });
+
+  // Torch para PPG de dedo
+  if (G.sensor === "camera_ppg" && $("torchToggle").checked) {
+    try {
+      const track = G.stream.getVideoTracks()[0];
+      await track.applyConstraints({ advanced: [{ torch: true }] });
+    } catch (_) { /* no soportado */ }
   }
 
-  try{
-    if(trackRef && torchAvailable){
-      applyTorch(false);
+  const canvas2d = $("frameCanvas");
+  canvas2d.width  = 4;
+  canvas2d.height = 4;
+
+  let lastFrame = 0;
+  const interval = 1000 / PPG_SR;
+
+  function captureFrame(ts) {
+    if (!G.running) return;
+    if (ts - lastFrame >= interval) {
+      lastFrame = ts;
+      G.frameCtx.drawImage(G.videoEl, 0, 0, 4, 4);
+      const px = G.frameCtx.getImageData(0, 0, 4, 4).data;
+      let val = 0;
+      if (isFace) {
+        // rPPG: canal verde es más sensible al flujo sanguíneo facial
+        for (let i = 1; i < px.length; i += 4) val += px[i];
+      } else {
+        // PPG dedo: canal rojo + infrarrojo emulado
+        for (let i = 0; i < px.length; i += 4) val += px[i];
+      }
+      val /= (px.length / 4);
+      G.ppgBuffer.push(val);
+      pushSignal(val);
     }
-  }catch(_e){}
-
-  if(mediaStream){
-    mediaStream.getTracks().forEach(t => t.stop());
-    mediaStream = null;
+    requestAnimationFrame(captureFrame);
   }
 
-  trackRef = null;
-  torchAvailable = false;
-  torchEnabled = false;
-
-  setQuality(null);
+  requestAnimationFrame(captureFrame);
 }
 
-/* ==========================================================
-   Rostro rPPG (1 min)
-   - FaceDetector si existe (Chrome/Android)
-   - Fallback ROI centrado (parte superior/central del frame)
-   - Extrae canal VERDE (mejor SNR típico en rPPG)
-========================================================== */
-async function startFaceRPPG(){
-  videoEl = document.getElementById("video");
-  frameCanvas = document.getElementById("frameCanvas");
-  if(!videoEl || !frameCanvas) throw new Error("Faltan elementos de cámara en el DOM.");
-
-  frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
-
-  ppgSamples = [];
-  ppgTimestamps = [];
-  setQuality(null);
-
-  setStatus("Solicitando permiso de cámara (frontal)…", "warn");
-
-  try{
-    mediaStream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: "user" },
-        frameRate: { ideal: 30, min: 24, max: 30 },
-        width: { ideal: 640 },
-        height: { ideal: 480 }
-      },
-      audio: false
+function stopCamera() {
+  if (G.stream) {
+    G.stream.getTracks().forEach(t => {
+      try {
+        if (t.getConstraints().advanced) t.applyConstraints({ advanced: [{ torch: false }] });
+      } catch (_) {}
+      t.stop();
     });
-  }catch(e){
-    throw new Error(explainCameraPermissionError(e));
+    G.stream = null;
+  }
+  if (G.videoEl) { G.videoEl.srcObject = null; }
+}
+
+// ── Vibración / SCG ───────────────────────────────────────────────
+function startVibration() {
+  if (!window.DeviceMotionEvent) {
+    alert("Tu dispositivo no soporta el acelerómetro.");
+    throw new Error("No DeviceMotionEvent");
   }
 
-  videoEl.srcObject = mediaStream;
-  videoEl.playsInline = true;
-  videoEl.muted = true;
-  try { await videoEl.play(); } catch(_e) {}
-
-  const t0 = Date.now();
-  while ((videoEl.videoWidth === 0 || videoEl.videoHeight === 0) && (Date.now() - t0 < 4000)) {
-    await new Promise(r => setTimeout(r, 50));
+  // iOS 13+ requiere permiso explícito
+  if (typeof DeviceMotionEvent.requestPermission === "function") {
+    DeviceMotionEvent.requestPermission().then(state => {
+      if (state !== "granted") throw new Error("Permiso denegado");
+      _bindMotion();
+    });
+  } else {
+    _bindMotion();
   }
-  if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) {
-    throw new Error("Cámara autorizada pero sin frames. Revisá permisos y recargá.");
-  }
+}
 
-  trackRef = mediaStream.getVideoTracks()[0];
-
-  // ROI dinámico: intentamos FaceDetector
-  let faceDetector = null;
-  if("FaceDetector" in window){
-    try{
-      faceDetector = new window.FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
-    }catch(_e){
-      faceDetector = null;
-    }
-  }
-
-  // canvas del ROI (tamaño fijo chico)
-  const roiW = 80, roiH = 80;
-  frameCanvas.width = roiW;
-  frameCanvas.height = roiH;
-
-  setStatus("Cámara frontal activa • recolectando rPPG", "ok");
-
-  // filtro simple en vivo
-  let baseline = null;
-  const dcAlpha = 0.02;
-  let hpState = 0;
-  let prevNorm = null;
-  const hpAlpha = 0.96;
-  let lpState = 0;
-  const lpAlpha = 0.20;
-
-  const framePeriod = 1000 / targetFps;
-  let lastTick = performance.now();
-  let acc = 0;
-
-  const loop = async (now) => {
-    if(!measuring) return;
-
-    acc += (now - lastTick);
-    lastTick = now;
-
-    let steps = 0;
-    while(acc >= framePeriod && steps < 2){
-      acc -= framePeriod;
-      steps++;
-
-      const vw = videoEl.videoWidth;
-      const vh = videoEl.videoHeight;
-
-      // ROI por defecto (fallback): centro superior (mejores mejillas/frente)
-      let sx = (vw / 2) - (roiW / 2);
-      let sy = (vh * 0.30) - (roiH / 2);
-
-      // si FaceDetector existe, intentamos localizar cara y usar frente/mejillas
-      if(faceDetector){
-        try{
-          const tmpCanvas = document.createElement("canvas");
-          tmpCanvas.width = vw;
-          tmpCanvas.height = vh;
-          const tmpCtx = tmpCanvas.getContext("2d", { willReadFrequently: true });
-          tmpCtx.drawImage(videoEl, 0, 0, vw, vh);
-          const faces = await faceDetector.detect(tmpCanvas);
-          if(faces && faces.length){
-            const box = faces[0].boundingBox;
-            // ROI: región superior-central de la cara (frente)
-            sx = box.x + box.width * 0.30;
-            sy = box.y + box.height * 0.18;
-          }
-        }catch(_e){}
-      }
-
-      // clamp para no salir del frame
-      sx = Math.max(0, Math.min(vw - roiW, sx));
-      sy = Math.max(0, Math.min(vh - roiH, sy));
-
-      frameCtx.drawImage(videoEl, sx, sy, roiW, roiH, 0, 0, roiW, roiH);
-      const img = frameCtx.getImageData(0, 0, roiW, roiH).data;
-
-      // canal VERDE
-      const meanG = meanChannelROI(img, 1);
-
-      if(baseline === null) baseline = meanG;
-      baseline = (1 - dcAlpha) * baseline + dcAlpha * meanG;
-
-      let acSig = meanG - baseline;
-      let norm = 0;
-      if(baseline > 12) norm = acSig / baseline;
-
-      if(prevNorm === null) prevNorm = norm;
-      hpState = hpAlpha * (hpState + norm - prevNorm);
-      prevNorm = norm;
-
-      lpState = lpState + lpAlpha * (hpState - lpState);
-
-      let clean = lpState;
-      if(clean > 0.08) clean = 0.08;
-      if(clean < -0.08) clean = -0.08;
-
-      ppgTimestamps.push(performance.now());
-      ppgSamples.push(clean);
-
-      pushChartPoint(clean * 220);
-
-      // calidad simple por amplitud local
-      if(ppgSamples.length > 60){
-        const w = ppgSamples.slice(-60);
-        let mn = Infinity, mx = -Infinity;
-        for(const v of w){ if(v < mn) mn=v; if(v > mx) mx=v; }
-        const p2p = mx - mn;
-        const score = 100 * Math.max(0, Math.min(1, (p2p - 0.0025) / 0.012));
-        setQuality(score);
-
-        if(score < 35){
-          setStatus("Señal baja • más luz frontal • no muevas la cabeza", "warn");
-        } else if(score < 70){
-          setStatus("Señal media • quedate quieto • no hables", "warn");
-        } else {
-          setStatus("Señal estable • excelente", "ok");
-        }
-      }
-    }
-
-    rafId = requestAnimationFrame(loop);
+function _bindMotion() {
+  G.motionBuffer = [];
+  G.motionHandler = (e) => {
+    if (!G.running) return;
+    const a = e.accelerationIncludingGravity;
+    if (!a) return;
+    const mag = Math.sqrt((a.x||0)**2 + (a.y||0)**2 + (a.z||0)**2);
+    G.motionBuffer.push(mag);
+    G.ppgBuffer.push(mag);
+    pushSignal(mag);
   };
-
-  rafId = requestAnimationFrame(loop);
+  window.addEventListener("devicemotion", G.motionHandler, { passive: true });
 }
 
-/* ==========================================================
-   Vibración SCG (1 min) - DeviceMotionEvent
-========================================================== */
-async function requestMotionPermissionIfNeeded(){
-  // iOS requiere gesto usuario + requestPermission
-  if(typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function"){
-    const res = await DeviceMotionEvent.requestPermission();
-    if(res !== "granted"){
-      throw new Error("Permiso de movimiento denegado. Activá 'Movimiento y orientación' y reintentá.");
-    }
+function stopVibration() {
+  if (G.motionHandler) {
+    window.removeEventListener("devicemotion", G.motionHandler);
+    G.motionHandler = null;
   }
 }
 
-function startVibration(){
-  vibSamples = [];
-  vibTimestamps = [];
-  motionListening = true;
+// ── Polar H10 BLE ─────────────────────────────────────────────────
+const POLAR_SERVICE_HR   = "0000180d-0000-1000-8000-00805f9b34fb";
+const POLAR_CHAR_HR      = "00002a37-0000-1000-8000-00805f9b34fb";
+const POLAR_SERVICE_PMD  = "fb005c80-02e7-f387-1cad-8acd2d8df0c8";
+const POLAR_CHAR_PMD_CP  = "fb005c81-02e7-f387-1cad-8acd2d8df0c8";
+const POLAR_CHAR_PMD_DAT = "fb005c82-02e7-f387-1cad-8acd2d8df0c8";
 
-  const handler = (ev) => {
-    if(!measuring || !motionListening) return;
-
-    const a = ev.acceleration || ev.accelerationIncludingGravity;
-
-    // si viene null, abort suave
-    if(!a) return;
-
-    // magnitud (robusta al eje)
-    const ax = Number(a.x) || 0;
-    const ay = Number(a.y) || 0;
-    const az = Number(a.z) || 0;
-    const mag = Math.sqrt(ax*ax + ay*ay + az*az);
-
-    vibTimestamps.push(performance.now());
-    vibSamples.push(mag);
-
-    // chart (escala)
-    pushChartPoint(mag * 18);
-  };
-
-  window.addEventListener("devicemotion", handler, { passive: true });
-
-  // guardamos para poder remover
-  startVibration._handler = handler;
-
-  setStatus("Vibración activa • recolectando acelerómetro", "ok");
-  setQuality(null);
-}
-
-function stopVibration(){
-  motionListening = false;
-  const handler = startVibration._handler;
-  if(handler){
-    window.removeEventListener("devicemotion", handler);
-    startVibration._handler = null;
-  }
-}
-
-/* ========================= Polar BLE ========================= */
-function parseHeartRateMeasurement(value){
-  const flags = value.getUint8(0);
-  const hrValue16 = (flags & 0x01) !== 0;
-  const rrPresent = (flags & 0x10) !== 0;
-
-  let index = 1;
-
-  if(hrValue16) index += 2;
-  else index += 1;
-
-  if((flags & 0x08) !== 0) index += 2;
-
-  const rrs = [];
-  if(rrPresent){
-    while(index + 1 < value.byteLength){
-      const rr = value.getUint16(index, true);
-      index += 2;
-      const rrMs = (rr / 1024.0) * 1000.0;
-      rrs.push(rrMs);
-    }
-  }
-  return rrs;
-}
-
-async function connectPolarH10(){
-  if(!navigator.bluetooth){
-    throw new Error("Web Bluetooth no disponible en este navegador.");
+async function startPolarH10() {
+  if (!navigator.bluetooth) {
+    alert("Web Bluetooth no disponible. Usá Chrome/Edge con HTTPS.");
+    throw new Error("No Bluetooth");
   }
 
   setStatus("Buscando Polar H10…", "warn");
 
-  bleDevice = await navigator.bluetooth.requestDevice({
-    filters: [{ services: ["heart_rate"] }]
+  G.bleDevice = await navigator.bluetooth.requestDevice({
+    filters: [{ namePrefix: "Polar" }],
+    optionalServices: [POLAR_SERVICE_HR, POLAR_SERVICE_PMD],
   });
 
-  bleDevice.addEventListener("gattserverdisconnected", () => {
-    setStatus("Polar desconectado", "bad");
-    measuring = false;
-    enableControls();
-  });
+  G.bleServer = await G.bleDevice.gatt.connect();
+  setStatus("Polar conectado", "ok");
 
-  const server = await bleDevice.gatt.connect();
-  const service = await server.getPrimaryService("heart_rate");
-  bleChar = await service.getCharacteristic("heart_rate_measurement");
+  // Intentar RR via PMD (más preciso)
+  let gotPMD = false;
+  try {
+    const pmdSvc  = await G.bleServer.getPrimaryService(POLAR_SERVICE_PMD);
+    const pmdCp   = await pmdSvc.getCharacteristic(POLAR_CHAR_PMD_CP);
+    const pmdDat  = await pmdSvc.getCharacteristic(POLAR_CHAR_PMD_DAT);
 
-  await bleChar.startNotifications();
-  bleChar.addEventListener("characteristicvaluechanged", (event) => {
-    if(!measuring) return;
-    const dv = event.target.value;
-    const rrs = parseHeartRateMeasurement(dv);
-    if(rrs.length){
-      rrs.forEach(rr => {
-        rrIntervalsMs.push(rr);
-        pushChartPoint(rr);
-      });
-    }
-  });
+    // Solicitar stream ECG
+    await pmdCp.writeValue(new Uint8Array([0x02, 0x00, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00]));
 
-  setStatus("Polar H10 conectado • recolectando RR", "ok");
-}
-
-async function startPolarH10(){
-  rrIntervalsMs = [];
-  await connectPolarH10();
-}
-
-async function stopPolarH10(){
-  try{ if(bleChar) await bleChar.stopNotifications(); }catch(_e){}
-  try{
-    if(bleDevice && bleDevice.gatt.connected){
-      bleDevice.gatt.disconnect();
-    }
-  }catch(_e){}
-  bleChar = null;
-  bleDevice = null;
-  setStatus("Polar detenido", "idle");
-}
-
-/* ========================= RR Upload ========================= */
-function parseCSVtoNumbers(text){
-  const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  const nums = [];
-  for(const ln of lines){
-    // separadores comunes
-    const parts = ln.split(/[;, \t]+/).filter(Boolean);
-    if(!parts.length) continue;
-    const v = Number(parts[0]);
-    if(Number.isFinite(v)) nums.push(v);
-  }
-  return nums;
-}
-
-async function loadRRFromFile(file){
-  const txt = await file.text();
-  const name = (file.name || "").toLowerCase();
-
-  // JSON
-  if(name.endsWith(".json") || file.type.includes("json")){
-    let obj = null;
-    try{ obj = JSON.parse(txt); }catch(_e){ throw new Error("JSON inválido."); }
-
-    if(Array.isArray(obj)){
-      return obj.map(Number).filter(Number.isFinite);
-    }
-    if(obj && Array.isArray(obj.rri_ms)){
-      return obj.rri_ms.map(Number).filter(Number.isFinite);
-    }
-    if(obj && Array.isArray(obj.rr)){
-      return obj.rr.map(Number).filter(Number.isFinite);
-    }
-    throw new Error("JSON: se espera array o {rri_ms:[...] }.");
-  }
-
-  // CSV
-  const nums = parseCSVtoNumbers(txt);
-  if(!nums.length) throw new Error("CSV vacío o sin números.");
-
-  return nums;
-}
-
-function normalizeRRUnits(rr){
-  // si parece segundos (valores típicos 0.3–2.2), pasamos a ms
-  const med = rr.slice().sort((a,b)=>a-b)[Math.floor(rr.length/2)];
-  if(med > 0 && med < 10) return rr.map(v => v * 1000.0);
-  return rr;
-}
-
-/* ========================= Measurement ========================= */
-async function startMeasurement(){
-  lastMetrics = null;
-
-  buildCards(null);
-  buildDashTiles(null);
-  buildHBADashboard(null);
-
-  measuring = true;
-  startedAt = Date.now();
-  enableControls();
-  setSensorChip();
-
-  if(chart){
-    chart.data.labels = [];
-    chart.data.datasets[0].data = [];
-    chart.update("none");
-  }
-
-  // anti-lock screen si se puede
-  await acquireWakeLock();
-
-  // countdown según sensor
-  if(sensorType === "face_rppg"){
-    selectedDurationMin = 1;
-    await runCountdown({
-      title: "Rostro rPPG",
-      text: "Sentate • mirá al frente • no hables • no muevas la cabeza.",
-      hint: "Luz frontal pareja. Evitá contraluz.",
-      seconds: 3
+    pmdDat.addEventListener("characteristicvaluechanged", e => {
+      if (!G.running) return;
+      parsePolarPMD(e.target.value);
     });
-  }
-  if(sensorType === "vibration_scg"){
-    selectedDurationMin = 1;
-    await runCountdown({
-      title: "Vibración SCG",
-      text: "Celular estable • postura cómoda • respiración suave.",
-      hint: "Desactivá bloqueo automático si tu navegador no soporta Wake Lock.",
-      seconds: 3
+    await pmdDat.startNotifications();
+    gotPMD = true;
+  } catch (_) { /* Fallback a HR service */ }
+
+  if (!gotPMD) {
+    // Fallback: usar HR characteristic (RR está en flag bit)
+    const hrSvc  = await G.bleServer.getPrimaryService(POLAR_SERVICE_HR);
+    const hrChar = await hrSvc.getCharacteristic(POLAR_CHAR_HR);
+    hrChar.addEventListener("characteristicvaluechanged", e => {
+      if (!G.running) return;
+      parseHRMeasurement(e.target.value);
     });
-  }
-
-  if(timerInterval) clearInterval(timerInterval);
-  timerInterval = setInterval(async () => {
-    setTimerText();
-    const elapsedSec = Math.floor((Date.now() - startedAt)/1000);
-    if(elapsedSec >= selectedDurationMin * 60){
-      await stopMeasurement(true);
-    }
-  }, 250);
-
-  if(sensorType === "camera_ppg"){
-    await startCameraFingerPPG();
-    return;
-  }
-
-  if(sensorType === "face_rppg"){
-    await startFaceRPPG();
-    return;
-  }
-
-  if(sensorType === "vibration_scg"){
-    await requestMotionPermissionIfNeeded();
-    startVibration();
-    return;
-  }
-
-  if(sensorType === "polar_h10"){
-    await startPolarH10();
-    return;
-  }
-
-  if(sensorType === "rr_upload"){
-    // modo “sin streaming”: calcula directo
-    await computeFromRRUpload();
-    // no se mide en vivo
-    await stopMeasurement(false, {skipStopSensors:true, skipBeep:true, alreadyStopped:true});
-    return;
+    await hrChar.startNotifications();
   }
 }
 
-async function stopMeasurement(autoStop=false, opts={}){
-  if(!measuring && !opts.alreadyStopped) return;
-
-  // cortamos timer
-  if(timerInterval){
-    clearInterval(timerInterval);
-    timerInterval = null;
+function parsePolarPMD(dv) {
+  // Frame ECG Polar PMD: byte 0 = tipo, bytes 10+ = muestras ECG int16 LE
+  const type = dv.getUint8(0);
+  if (type !== 0x00) return; // solo ECG
+  // Acumular muestras como señal y derivar RR simplificado
+  for (let i = 10; i + 1 < dv.byteLength; i += 3) {
+    const val = dv.getInt16(i, true);
+    pushSignal(val);
+    G.ppgBuffer.push(val);
   }
-  setTimerText();
+}
 
-  // detener sensores (salvo rr_upload)
-  if(!opts.skipStopSensors){
-    if(sensorType === "camera_ppg" || sensorType === "face_rppg"){
-      await stopCamera();
-    } else if(sensorType === "vibration_scg"){
-      stopVibration();
-    } else if(sensorType === "polar_h10"){
-      await stopPolarH10();
+function parseHRMeasurement(dv) {
+  const flags  = dv.getUint8(0);
+  const hrFmt  = flags & 0x01;
+  const hasRR  = (flags >> 4) & 0x01;
+  let offset   = hrFmt ? 3 : 2;
+
+  const hr = hrFmt ? dv.getUint16(1, true) : dv.getUint8(1);
+  pushSignal(hr);
+
+  if (hasRR) {
+    while (offset + 1 < dv.byteLength) {
+      const rr = dv.getUint16(offset, true) / 1024.0 * 1000.0;
+      offset += 2;
+      if (rr > 300 && rr < 2200) {
+        G.rrBuffer.push(rr);
+        // Usar el RR como señal visual
+        pushSignal(rr);
+      }
+    }
+  }
+}
+
+function stopPolarH10() {
+  try {
+    if (G.bleDevice && G.bleDevice.gatt.connected) G.bleDevice.gatt.disconnect();
+  } catch (_) {}
+  G.bleDevice = null;
+  G.bleServer = null;
+}
+
+// ── Importación RR ────────────────────────────────────────────────
+async function loadRRFile() {
+  const file = $("rrFile").files[0];
+  if (!file) throw new Error("Sin archivo");
+
+  const text = await file.text();
+  const name = file.name.toLowerCase();
+  let rrs = [];
+
+  if (name.endsWith(".json")) {
+    const obj = JSON.parse(text);
+    if (Array.isArray(obj)) rrs = obj.map(Number);
+    else if (obj.rri_ms) rrs = obj.rri_ms.map(Number);
+    else if (obj.rr)     rrs = obj.rr.map(Number);
+    else rrs = Object.values(obj).flat().map(Number);
+  } else {
+    // CSV: buscar columna "rr", "rri", "rri_ms" o primera columna
+    const lines = text.trim().split(/\r?\n/);
+    const header = lines[0].toLowerCase().split(/[,;\t]/);
+    let col = -1;
+    for (const key of ["rr", "rri", "rri_ms", "nn", "ibi"]) {
+      col = header.indexOf(key);
+      if (col >= 0) break;
+    }
+    if (col < 0) col = 0;
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].split(/[,;\t]/);
+      const v = parseFloat(parts[col]);
+      if (!isNaN(v)) rrs.push(v);
     }
   }
 
-  // estado
-  if(!opts.alreadyStopped){
-    measuring = false;
-    enableControls();
+  // Auto-detectar si está en segundos → convertir a ms
+  const mean = rrs.reduce((a, b) => a + b, 0) / rrs.length;
+  if (mean < 5) rrs = rrs.map(r => r * 1000);
+
+  rrs = rrs.filter(r => r > 200 && r < 2500);
+  if (rrs.length < 12) throw new Error(`Solo ${rrs.length} intervalos válidos. Mínimo 12.`);
+
+  G.rrBuffer = rrs;
+  rrs.forEach(r => pushSignal(r));
+  $("rrFileLabel").textContent = `✓ ${file.name} (${rrs.length} RR)`;
+  return rrs;
+}
+
+// ── Sesión principal ──────────────────────────────────────────────
+$("btnStart").addEventListener("click", startSession);
+$("btnStop").addEventListener("click",  () => stopSession(false));
+$("btnSave").addEventListener("click",  saveSession);
+
+async function startSession() {
+  G.ppgBuffer   = [];
+  G.rrBuffer    = [];
+  G.signalBuffer= [];
+  G.lastMetrics = null;
+  G.totalSeconds= G.durationMin * 60;
+  updateQuality(null);
+  $("freqWarning").classList.remove("visible");
+
+  const meta = SENSOR_META[G.sensor];
+
+  try {
+    if (G.sensor === "rr_upload") {
+      // Cargar archivo antes del countdown
+      await loadRRFile();
+      await showCountdown("Analizando…", "Procesando intervalos RR importados.", "No cierres la pestaña.", 3);
+      G.running = true;
+      setBtns(true);
+      setStatus("Analizando RR…", "ok");
+      // Para RR upload, calcular inmediatamente
+      await computeAndDisplay();
+      G.running = false;
+      setBtns(false);
+      return;
+    }
+
+    await showCountdown(
+      "Preparación",
+      meta.guide,
+      G.sensor === "polar_h10" ? "Aceptá el permiso Bluetooth cuando aparezca." : "No bloquees la pantalla.",
+      5
+    );
+
+    G.running = true;
+    setBtns(true);
+    setStatus("Midiendo…", "ok");
+
+    if (G.sensor === "polar_h10")   await startPolarH10();
+    if (G.sensor === "camera_ppg")  await startCamera();
+    if (G.sensor === "face_rppg")   await startCamera();
+    if (G.sensor === "vibration_scg") startVibration();
+
+    G.rafHandle = requestAnimationFrame(renderChart);
+    startTimer();
+
+  } catch (err) {
+    G.running = false;
+    setBtns(false);
+    setStatus("Error al iniciar", "bad");
+    console.error(err);
+    alert(`Error: ${err.message}`);
   }
+}
 
-  // release wakelock
-  await releaseWakeLock();
+async function stopSession(autoStop = false) {
+  G.running = false;
+  stopTimer();
 
-  // beep fin si fue automático por tiempo
-  if(autoStop && !opts.skipBeep){
-    beep(240, 880);
-    setTimeout(() => beep(240, 660), 260);
+  if (G.sensor === "camera_ppg" || G.sensor === "face_rppg") stopCamera();
+  if (G.sensor === "polar_h10")    stopPolarH10();
+  if (G.sensor === "vibration_scg") stopVibration();
+
+  setBtns(false);
+  setStatus(autoStop ? "Midición completa" : "Detenido", autoStop ? "ok" : "warn");
+
+  if (autoStop || G.ppgBuffer.length >= 30 || G.rrBuffer.length >= 12) {
+    await computeAndDisplay();
   }
+}
 
-  // si rr_upload ya calculó, no recalculamos
-  if(sensorType === "rr_upload"){
-    measuring = false;
-    enableControls();
-    return;
+// ── Cómputo y envío al backend ────────────────────────────────────
+async function computeAndDisplay() {
+  setStatus("Calculando HRV…", "warn");
+
+  const payload = buildPayload();
+
+  try {
+    const res  = await fetch("/api/compute", {
+      method : "POST",
+      headers: { "Content-Type": "application/json" },
+      body   : JSON.stringify(payload),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      setStatus("Error de cálculo", "bad");
+      alert(`Error HRV: ${data.error}`);
+      return;
+    }
+
+    G.lastMetrics = { ...data, ...payload };
+    updateDashboard(data);
+    updateQuality(data.quality_score ?? null);
+    setBtns(false);
+    setStatus("Análisis completado", "ok");
+
+    if (data.freq_warning) {
+      $("freqWarning").textContent = `⚠ ${data.freq_warning}`;
+      $("freqWarning").classList.add("visible");
+    }
+
+  } catch (err) {
+    setStatus("Sin conexión al servidor", "bad");
+    console.error(err);
+    alert("No se pudo conectar con el servidor. ¿El backend está corriendo?");
   }
+}
 
-  setStatus("Procesando HRV…", "warn");
+function buildPayload() {
+  const isRR  = G.sensor === "polar_h10" || G.sensor === "rr_upload";
+  const isSCG = G.sensor === "vibration_scg";
 
-  const payload = {
-    sensor_type: sensorType,
-    duration_minutes: selectedDurationMin,
-    age: document.getElementById("age")?.value || ""
+  const base = {
+    sensor_type     : isRR ? G.sensor : (isSCG ? "camera_ppg" : G.sensor),
+    duration_minutes: G.durationMin,
+    age             : $("age").value          || null,
+    sex             : $("sex").value          || null,
+    patient_id      : $("patientId").value    || "",
+    comorbidities   : $("comorbidities").value|| "",
+    notes           : $("notes").value        || "",
   };
 
-  if(sensorType === "camera_ppg" || sensorType === "face_rppg"){
-    // sampling rate estimado desde timestamps
-    let fs = targetFps;
-    if(ppgTimestamps.length > 10){
-      const diffs = [];
-      for(let i=1; i<ppgTimestamps.length; i++){
-        diffs.push((ppgTimestamps[i] - ppgTimestamps[i-1]) / 1000.0);
-      }
-      const meanDt = diffs.reduce((a,b)=>a+b,0) / diffs.length;
-      if(meanDt > 0) fs = 1.0 / meanDt;
-    }
-
-    let cleaned = replaceNonFinite(ppgSamples);
-    cleaned = clampByMAD(cleaned, 10.0);
-    cleaned = detrendMovingAverage(cleaned, fs, 1.8);
-    cleaned = iirHighPass(cleaned, fs, 0.5);
-    cleaned = iirLowPass(cleaned, fs, 4.5);
-    cleaned = winsorize(cleaned, 6.0);
-    cleaned = zscore(cleaned);
-
-    payload.ppg = cleaned;
-    payload.sampling_rate = fs;
-  }
-  else if(sensorType === "vibration_scg"){
-    // sampling rate desde timestamps
-    let fs = 60;
-    if(vibTimestamps.length > 10){
-      const diffs = [];
-      for(let i=1; i<vibTimestamps.length; i++){
-        diffs.push((vibTimestamps[i] - vibTimestamps[i-1]) / 1000.0);
-      }
-      const meanDt = diffs.reduce((a,b)=>a+b,0) / diffs.length;
-      if(meanDt > 0) fs = 1.0 / meanDt;
-    }
-    payload.accel_mag = vibSamples;
-    payload.sampling_rate = fs;
-  }
-  else if(sensorType === "polar_h10"){
-    payload.rri_ms = rrIntervalsMs;
+  if (isRR) {
+    base.rri_ms = G.rrBuffer.length > 0 ? G.rrBuffer : G.ppgBuffer;
+  } else if (isSCG) {
+    base.ppg           = G.ppgBuffer;
+    base.sampling_rate = SCG_SR;
+    base.sensor_type   = "camera_ppg";  // backend trata SCG como señal genérica
+  } else {
+    base.ppg           = G.ppgBuffer;
+    base.sampling_rate = PPG_SR;
   }
 
-  try{
-    const res = await fetch("/api/compute", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    const metrics = await res.json();
-    lastMetrics = metrics;
-
-    buildCards(metrics);
-    buildDashTiles(metrics);
-    buildHBADashboard(metrics);
-
-    if(metrics.error){
-      setStatus("Error en cálculo (ver tarjetas)", "bad");
-    } else {
-      const art = Number(metrics.artifact_percent);
-      if(Number.isFinite(art)){
-        if(art <= 8) setStatus("Cálculo OK • Calidad buena", "ok");
-        else if(art <= 18) setStatus("Cálculo OK • Calidad moderada", "warn");
-        else setStatus("Cálculo OK • Calidad baja (artefactos altos)", "bad");
-      } else {
-        setStatus("Cálculo OK", "ok");
-      }
-    }
-  }catch(e){
-    lastMetrics = { error: e.message || String(e) };
-    buildCards(lastMetrics);
-    buildDashTiles(lastMetrics);
-    buildHBADashboard(lastMetrics);
-    setStatus("Fallo comunicando con servidor", "bad");
-  }
-
-  measuring = false;
-  enableControls();
+  return base;
 }
 
-async function computeFromRRUpload(){
-  const fileInput = document.getElementById("rrFile");
-  const file = fileInput?.files?.[0];
-  if(!file) throw new Error("Elegí un archivo CSV/JSON con RR.");
+// ── Dashboard — render ────────────────────────────────────────────
+function updateDashboard(data) {
+  const dash = data.hba_dashboard;
+  if (!dash) return;
 
-  setStatus("Leyendo RR del archivo…", "warn");
+  renderSemaphore(dash.semaphore);
+  renderNorms(dash.norms, data.rmssd_corr);
+  renderCargas(dash.cargas);
+  renderMetrics(data);
+  renderBioTable(dash.biomarkers);
+  renderPlan(dash.semaphore.plan);
+}
 
-  let rr = await loadRRFromFile(file);
-  rr = rr.map(Number).filter(Number.isFinite);
-  rr = normalizeRRUnits(rr);
+function renderSemaphore(sem) {
+  const card = $("semaphoreCard");
+  card.className = `semaphore-card ${sem.key}`;
+  $("semaphoreIcon").textContent  = sem.icon;
+  $("semaphoreLabel").textContent = sem.label;
+  $("semaphoreDesc").textContent  = sem.description;
+}
 
-  if(rr.length < 12){
-    throw new Error("RR insuficientes en el archivo (mínimo recomendado: 12).");
+function renderNorms(norms, rmssdCorr) {
+  const sec = $("normsSection");
+  if (!norms || !norms.rmssd_low) return;
+  sec.style.display = "";
+
+  $("normsRange").textContent = `${norms.rmssd_low.toFixed(0)}–${norms.rmssd_high.toFixed(0)} ms`;
+
+  // Posicionar marcador en la barra (0% = bajo, 50% = normal, 100% = alto)
+  if (rmssdCorr != null) {
+    const lo  = norms.rmssd_low;
+    const hi  = norms.rmssd_high;
+    const mid = (lo + hi) / 2;
+    let pct;
+    if (rmssdCorr <= lo)  pct = Math.max(0, (rmssdCorr / lo) * 35);
+    else if (rmssdCorr <= hi) pct = 35 + ((rmssdCorr - lo) / (hi - lo)) * 30;
+    else pct = Math.min(100, 65 + ((rmssdCorr - hi) / (hi * 0.5)) * 35);
+    $("normsMarker").style.left = `${pct}%`;
   }
+}
 
-  // duración inferida por suma RR
-  const totalMs = rr.reduce((a,b)=>a+b,0);
-  const inferredMin = totalMs / 60000.0;
+function renderCargas(cargas) {
+  const grid = $("cargasGrid");
+  if (!cargas) return;
+
+  const items = [
+    { key: "carga_autonomica",  label: "Autonómica" },
+    { key: "carga_emocional",   label: "Emocional"  },
+    { key: "carga_fisica",      label: "Física"     },
+    { key: "estres",            label: "Estrés"     },
+  ];
+
+  grid.innerHTML = items.map(it => {
+    const c = cargas[it.key] || {};
+    const v = c.value != null ? Math.round(c.value) : "—";
+    const l = (c.level || "bajo").replace(/ /g, "-");
+    const pct = c.value != null ? c.value : 0;
+    return `
+      <div class="carga-item">
+        <div class="carga-name">${it.label}</div>
+        <div class="carga-value">${v}<small style="font-size:0.5em;font-weight:400;color:var(--text-muted)"> / 100</small></div>
+        <div class="carga-track"><div class="carga-fill ${l}" style="width:${pct}%"></div></div>
+        <div class="carga-level ${l}">${c.level || "—"}</div>
+      </div>`;
+  }).join("");
+}
+
+function renderMetrics(data) {
+  const grid = $("metricsGrid");
+  const fmt = (v, dec=1) => (v != null && isFinite(v)) ? (+v).toFixed(dec) : "—";
+
+  const art  = data.artifact_percent;
+  const artCls = art == null ? "" : art < 10 ? "ok" : art < 25 ? "warn" : "bad";
+
+  const items = [
+    { k: "FC media",    v: fmt(data.hr_mean,  0), u: "bpm", cls: "" },
+    { k: "FC max",      v: fmt(data.hr_max,   0), u: "bpm", cls: "" },
+    { k: "RMSSD",       v: fmt(data.rmssd,    1), u: "ms",  cls: "" },
+    { k: "RMSSD corr",  v: fmt(data.rmssd_corr,1),u:"ms",  cls: "" },
+    { k: "SDNN",        v: fmt(data.sdnn,     1), u: "ms",  cls: "" },
+    { k: "Calidad señal",v: fmt(data.quality_score,0), u: "%", cls: "" },
+    { k: "Artefactos",  v: fmt(art, 1),           u: "%",  cls: artCls },
+    { k: "N° RR",       v: data.n_rr ?? "—",      u: "",   cls: "" },
+  ];
+
+  grid.innerHTML = items.map(i =>
+    `<div class="metric-mini ${i.cls}">
+       <div class="metric-mini-key">${i.k}</div>
+       <div class="metric-mini-val">${i.v}</div>
+       <div class="metric-mini-unit">${i.u}</div>
+     </div>`
+  ).join("");
+}
+
+function renderBioTable(biomarkers) {
+  const wrap = $("bioTableWrap");
+  if (!biomarkers || !biomarkers.length) return;
+
+  const fmt = v => (v != null && isFinite(v)) ? (+v).toFixed(2) : "—";
+
+  const rows = biomarkers.map(b => {
+    const state = b.state || "informativo";
+    const stateLabel = {
+      alto:"Alto", medio:"Normal", bajo:"Bajo",
+      informativo:"—", insuficiente:"Insuf."
+    }[state] || state;
+
+    return `<tr>
+      <td class="bio-name">${b.name}</td>
+      <td class="bio-val">${fmt(b.value)} <span class="bio-unit">${b.unit || ""}</span></td>
+      <td><span class="badge-state ${state}">${stateLabel}</span></td>
+      <td class="bio-detail">${b.detail || ""}</td>
+    </tr>`;
+  }).join("");
+
+  wrap.innerHTML = `
+    <table class="bio-table">
+      <thead><tr>
+        <th>Biomarcador</th>
+        <th>Valor</th>
+        <th>Estado</th>
+        <th>Referencia / Nota</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderPlan(plan) {
+  const list = $("planList");
+  if (!plan || !plan.length) return;
+
+  list.innerHTML = `<div class="plan-list">` +
+    plan.map(p => `
+      <div class="plan-item">
+        <span class="plan-label">${p.item}</span>
+        <div class="plan-pct-wrap">
+          <div class="plan-track">
+            <div class="plan-fill" style="width:${p.pct}%"></div>
+          </div>
+          <span class="plan-pct-label">${p.pct}%</span>
+        </div>
+      </div>`
+    ).join("") + `</div>`;
+}
+
+// ── Guardar sesión ────────────────────────────────────────────────
+async function saveSession() {
+  if (!G.lastMetrics) return;
 
   const payload = {
-    sensor_type: "rr_upload",
-    duration_minutes: inferredMin,
-    rri_ms: rr,
-    age: document.getElementById("age")?.value || ""
+    patient_id    : $("patientId").value     || "",
+    age           : $("age").value           || null,
+    sex           : $("sex").value           || null,
+    comorbidities : $("comorbidities").value || "",
+    notes         : $("notes").value         || "",
+    metrics       : G.lastMetrics,
   };
 
-  try{
-    const res = await fetch("/api/compute", {
-      method: "POST",
+  setStatus("Guardando…", "warn");
+  try {
+    const res  = await fetch("/api/save", {
+      method : "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+      body   : JSON.stringify(payload),
     });
-    const metrics = await res.json();
-    lastMetrics = metrics;
-
-    buildCards(metrics);
-    buildDashTiles(metrics);
-    buildHBADashboard(metrics);
-
-    if(metrics.error){
-      setStatus("Error en cálculo (archivo RR)", "bad");
+    const data = await res.json();
+    if (data.ok) {
+      setStatus("Guardado ✓", "ok");
     } else {
-      setStatus("Cálculo OK (archivo RR)", "ok");
-      beep(200, 880);
+      setStatus("Error al guardar", "bad");
     }
-  }catch(e){
-    lastMetrics = { error: e.message || String(e) };
-    buildCards(lastMetrics);
-    buildDashTiles(lastMetrics);
-    buildHBADashboard(lastMetrics);
-    setStatus("Fallo comunicando con servidor", "bad");
-  }
-
-  enableControls();
-}
-
-async function saveResult(){
-  if(!lastMetrics || lastMetrics.error){
-    setStatus("No hay métricas válidas para guardar", "warn");
-    return;
-  }
-
-  const studentId = document.getElementById("studentId").value;
-  const age = document.getElementById("age").value;
-  const comorbidities = document.getElementById("comorbidities").value;
-  const notes = document.getElementById("notes").value;
-
-  const payload = {
-    student_id: studentId,
-    age: age,
-    comorbidities: comorbidities,
-    notes: notes,
-    metrics: lastMetrics
-  };
-
-  setStatus("Guardando en dataset_hba.csv…", "warn");
-
-  try{
-    const res = await fetch("/api/save", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    const out = await res.json();
-    if(out.ok){
-      setStatus("Guardado OK • dataset_hba.csv actualizado", "ok");
-    } else {
-      setStatus("No se pudo guardar", "bad");
-    }
-  }catch(_e){
-    setStatus("Error guardando", "bad");
+  } catch (err) {
+    setStatus("Sin conexión", "bad");
+    console.error(err);
   }
 }
 
-/* ========================= Init ========================= */
-window.addEventListener("DOMContentLoaded", () => {
-  initChart();
-  setupDurationButtons();
-  setupSensorSelector();
-
-  setSensorChip();
-  enableControls();
-  buildCards(null);
-  buildDashTiles(null);
-  buildHBADashboard(null);
-  setQuality(null);
-  setTimerText();
-  setStatus("Listo", "idle");
-
-  // torch toggle
-  const tt = document.getElementById("torchToggle");
-  if(tt){
-    readTorchModeFromUI();
-    tt.addEventListener("change", () => {
-      readTorchModeFromUI();
-      if(trackRef && torchAvailable){
-        if(torchMode === "off") applyTorch(false);
-        else applyTorch(true);
-      }
-    });
+// ── RR file preview ───────────────────────────────────────────────
+$("rrFile").addEventListener("change", async () => {
+  try {
+    await loadRRFile();
+    setStatus(`RR cargado (${G.rrBuffer.length})`, "ok");
+    updateQuality(null);
+  } catch (err) {
+    alert(`Error al leer archivo: ${err.message}`);
   }
-
-  // RR file hint immediate
-  const rrFile = document.getElementById("rrFile");
-  if(rrFile){
-    rrFile.addEventListener("change", () => {
-      if(rrFile.files && rrFile.files[0]){
-        setStatus("Archivo RR listo. Presioná Iniciar.", "ok");
-      }
-    });
-  }
-
-  // sensor UI initial
-  updateUIForSensor();
-
-  document.getElementById("btnStart").addEventListener("click", async () => {
-    if(measuring) return;
-    try{
-      await startMeasurement();
-    }catch(e){
-      measuring = false;
-      enableControls();
-      await releaseWakeLock();
-      setStatus(e.message || String(e), "bad");
-    }
-  });
-
-  document.getElementById("btnStop").addEventListener("click", async () => {
-    await stopMeasurement(false);
-  });
-
-  document.getElementById("btnSave").addEventListener("click", async () => {
-    await saveResult();
-  });
 });
+
+// ── Torch toggle label ────────────────────────────────────────────
+$("torchToggle").addEventListener("change", () => {
+  $("torchLabel").textContent = $("torchToggle").checked ? "AUTO" : "OFF";
+});
+
+// ── Init ──────────────────────────────────────────────────────────
+buildChart();
+G.rafHandle = requestAnimationFrame(renderChart);
+$("sensorType").dispatchEvent(new Event("change"));
+setStatus("Listo");
+console.log("HBA v2.0 iniciado");
