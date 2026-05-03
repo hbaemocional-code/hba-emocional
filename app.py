@@ -1,5 +1,17 @@
+"""
+HBA — Heart Beat Autonomic  |  v2.0
+Backend Flask refactorizado:
+  - Semáforo 4 niveles con nomenclatura clínica
+  - Cargas autonómica / emocional / física diferenciadas
+  - Índices no lineales: SD1, SD2, DFA α1 aproximado
+  - Supabase (PostgreSQL) como base de datos persistente
+  - Corrección de RMSSD por duración del test (1/3/5 min)
+  - Campo sexo en todos los flujos
+  - Baevsky para todos los tipos de sensor
+"""
+
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -9,11 +21,32 @@ from scipy import interpolate, signal
 
 app = Flask(__name__)
 
-DATASET_FILE = "dataset_hba.csv"
+# ─────────────────────────────────────────
+# Supabase (opcional — si no hay env var, CSV fallback)
+# ─────────────────────────────────────────
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_TABLE = "hba_sessions"
+CSV_FALLBACK = "dataset_hba_fallback.csv"
 
-# ============================
-# Utilidades
-# ============================
+_supabase_client = None
+
+def get_supabase():
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            from supabase import create_client
+            _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception:
+            _supabase_client = None
+    return _supabase_client
+
+
+# ─────────────────────────────────────────
+# Utilidades numéricas
+# ─────────────────────────────────────────
 
 def _as_float(x):
     try:
@@ -30,7 +63,6 @@ def _finite_array(x):
 
 
 def _sanitize_for_json(obj):
-    """Evita NaN/Inf en JSON (rompen JSON y generan 'Unexpected token N')."""
     if obj is None:
         return None
     if isinstance(obj, (np.floating, float)):
@@ -45,59 +77,11 @@ def _sanitize_for_json(obj):
     return obj
 
 
-# ============================
-# Calidad RR + Corrección (mejorada)
-# ============================
-
-def clean_rri_ms(rri_ms: np.ndarray):
-    """
-    Limpieza/corrección de RR (ms):
-    - Rechazo fisiológico tolerante: 300–2000 ms (30–200 bpm)
-    - Outliers robustos (MAD)
-    - Corrección por interpolación
-    """
-    rri_ms = _finite_array(rri_ms)
-
-    if len(rri_ms) < 10:
-        return rri_ms, np.nan, np.zeros(len(rri_ms), dtype=bool)
-
-    # más realista para humanos (evita HR min 28 / HR max 240 por ruido)
-    bad = (rri_ms < 300) | (rri_ms > 2000)
-
-    base = rri_ms[~bad] if np.any(~bad) else rri_ms
-    med = np.median(base)
-    mad = np.median(np.abs(base - med)) + 1e-9
-
-    robust_z = 0.6745 * (rri_ms - med) / mad
-    bad = bad | (np.abs(robust_z) > 4.5)
-
-    artifact_percent = 100.0 * (np.sum(bad) / len(rri_ms))
-
-    if not np.any(bad):
-        return rri_ms, artifact_percent, bad
-
-    idx = np.arange(len(rri_ms))
-    good_idx = idx[~bad]
-    if len(good_idx) < 3:
-        return rri_ms, artifact_percent, bad
-
-    f = interpolate.interp1d(
-        good_idx, rri_ms[~bad], kind="linear",
-        fill_value="extrapolate", bounds_error=False
-    )
-    rri_clean = rri_ms.copy()
-    rri_clean[bad] = f(idx[bad])
-
-    return rri_clean, artifact_percent, bad
-
+# ─────────────────────────────────────────
+# Limpieza y corrección de RR
+# ─────────────────────────────────────────
 
 def _kubios_like_artifact_mask(rr_ms: np.ndarray, win=11):
-    """
-    Heurística estilo Kubios:
-    - compara cada RR contra mediana local
-    - marca artefacto si desviación relativa es alta
-    - y/o si el salto dRR es demasiado grande
-    """
     rr = _finite_array(rr_ms)
     n = rr.size
     if n < 15:
@@ -115,13 +99,7 @@ def _kubios_like_artifact_mask(rr_ms: np.ndarray, win=11):
 
     rel_dev = np.abs(rr - med_local) / (med_local + 1e-9)
     drr = np.abs(np.diff(rr, prepend=rr[0])) / (med_local + 1e-9)
-
-    # thresholds conservadores (no matar test por micro-ruido)
-    # rel_dev > 0.20 = 20% fuera de mediana local
-    # drr > 0.25 = salto de 25%
     bad = (rel_dev > 0.20) | (drr > 0.25)
-
-    # también fisiológico
     bad = bad | (rr < 300) | (rr > 2000)
     return bad
 
@@ -130,33 +108,48 @@ def _interpolate_bad(rr_ms: np.ndarray, bad_mask: np.ndarray):
     rr = np.asarray(rr_ms, dtype=float)
     bad = np.asarray(bad_mask, dtype=bool)
     n = rr.size
-    if n < 3:
+    if n < 3 or not np.any(bad):
         return rr
-
-    if not np.any(bad):
-        return rr
-
     idx = np.arange(n)
     good_idx = idx[~bad]
     if good_idx.size < 3:
-        # no se puede interpolar bien
         return rr
-
-    f = interpolate.interp1d(
-        good_idx, rr[~bad], kind="linear",
-        fill_value="extrapolate", bounds_error=False
-    )
+    f = interpolate.interp1d(good_idx, rr[~bad], kind="linear",
+                             fill_value="extrapolate", bounds_error=False)
     out = rr.copy()
     out[bad] = f(idx[bad])
     return out
 
 
+def clean_rri_ms(rri_ms: np.ndarray):
+    rri_ms = _finite_array(rri_ms)
+    if len(rri_ms) < 10:
+        return rri_ms, np.nan, np.zeros(len(rri_ms), dtype=bool)
+
+    bad = (rri_ms < 300) | (rri_ms > 2000)
+    base = rri_ms[~bad] if np.any(~bad) else rri_ms
+    med = np.median(base)
+    mad = np.median(np.abs(base - med)) + 1e-9
+    robust_z = 0.6745 * (rri_ms - med) / mad
+    bad = bad | (np.abs(robust_z) > 4.5)
+
+    artifact_percent = 100.0 * (np.sum(bad) / len(rri_ms))
+    if not np.any(bad):
+        return rri_ms, artifact_percent, bad
+
+    idx = np.arange(len(rri_ms))
+    good_idx = idx[~bad]
+    if len(good_idx) < 3:
+        return rri_ms, artifact_percent, bad
+
+    f = interpolate.interp1d(good_idx, rri_ms[~bad], kind="linear",
+                             fill_value="extrapolate", bounds_error=False)
+    rri_clean = rri_ms.copy()
+    rri_clean[bad] = f(idx[bad])
+    return rri_clean, artifact_percent, bad
+
+
 def _windowed_rr_salvage(rr_ms: np.ndarray, window_beats=40, step_beats=20, max_artifact_pct=25.0):
-    """
-    Rescata segmentos de RR de mejor calidad (no rompe test).
-    - Trabaja en el dominio de beats (robusto incluso si no hay timestamps).
-    - Devuelve rr_rescued, usable_ratio, artifact_percent_global
-    """
     rr = _finite_array(rr_ms)
     n = rr.size
     if n < 20:
@@ -164,7 +157,6 @@ def _windowed_rr_salvage(rr_ms: np.ndarray, window_beats=40, step_beats=20, max_
 
     w = max(25, int(window_beats))
     s = max(10, int(step_beats))
-
     segments = []
     qualities = []
 
@@ -175,51 +167,83 @@ def _windowed_rr_salvage(rr_ms: np.ndarray, window_beats=40, step_beats=20, max_
         if art <= max_artifact_pct:
             seg_clean = _interpolate_bad(seg, bad)
             segments.append(seg_clean)
-            # score: más alto = mejor
             qualities.append(100.0 - art)
 
     if not segments:
-        # fallback: limpiar todo, pero no tirar error
         bad_all = _kubios_like_artifact_mask(rr)
         rr_clean = _interpolate_bad(rr, bad_all)
         art = 100.0 * bad_all.mean()
         usable_ratio = max(0.0, 1.0 - art / 100.0)
         return rr_clean, usable_ratio, art
 
-    # elegir top segmentos y concatenar (evita zonas malas)
     order = np.argsort(qualities)[::-1]
     segments = [segments[i] for i in order]
+    rr_rescued = np.concatenate(segments)[:n]
 
-    rr_rescued = np.concatenate(segments)
-    rr_rescued = rr_rescued[:n]  # no crecer indefinidamente
-
-    # artefactos globales estimados desde rr original
     bad_all = _kubios_like_artifact_mask(rr)
     art_global = 100.0 * bad_all.mean()
-
     usable_ratio = min(1.0, max(0.0, len(rr_rescued) / max(1, n)))
     return rr_rescued, usable_ratio, art_global
 
 
-def rri_to_peaks(rri_ms: np.ndarray, sampling_rate=1000):
-    rri_ms = _finite_array(rri_ms)
-    if len(rri_ms) < 3:
-        return None
+# ─────────────────────────────────────────
+# Métricas no lineales
+# ─────────────────────────────────────────
 
-    peak_times_s = np.cumsum(rri_ms) / 1000.0
-    peak_samples = np.unique(np.round(peak_times_s * sampling_rate).astype(int))
-    if len(peak_samples) < 3:
-        return None
+def compute_poincare(rr_ms: np.ndarray):
+    """SD1, SD2 y ratio SD1/SD2 del diagrama de Poincaré."""
+    rr = _finite_array(rr_ms)
+    if rr.size < 10:
+        return np.nan, np.nan, np.nan
+    d = np.diff(rr)
+    sd1 = float(np.sqrt(0.5 * np.var(d, ddof=1))) if len(d) > 1 else np.nan
+    sd2 = float(np.sqrt(max(0, 2 * np.var(rr, ddof=1) - 0.5 * np.var(d, ddof=1)))) if len(d) > 1 else np.nan
+    ratio = (sd1 / sd2) if (np.isfinite(sd1) and np.isfinite(sd2) and sd2 > 0) else np.nan
+    return sd1, sd2, ratio
 
-    length = int(peak_samples[-1] + sampling_rate)
-    peaks = np.zeros(length, dtype=int)
-    peaks[peak_samples] = 1
-    return peaks
+
+def compute_dfa_alpha1_approx(rr_ms: np.ndarray):
+    """
+    DFA α1 aproximado (escala corta 4-16 latidos).
+    Valor normal en reposo: ~1.0–1.5. Bajo (<0.75) indica desregulación.
+    """
+    rr = _finite_array(rr_ms)
+    n = rr.size
+    if n < 32:
+        return np.nan
+
+    y = np.cumsum(rr - np.mean(rr))
+    scales = [4, 6, 8, 10, 12, 16]
+    fn = []
+    for s in scales:
+        if n < s * 2:
+            continue
+        segments = n // s
+        f2_list = []
+        for k in range(segments):
+            seg = y[k*s:(k+1)*s]
+            x = np.arange(s)
+            p = np.polyfit(x, seg, 1)
+            trend = np.polyval(p, x)
+            f2_list.append(np.mean((seg - trend) ** 2))
+        if f2_list:
+            fn.append(np.sqrt(np.mean(f2_list)))
+
+    if len(fn) < 3:
+        return np.nan
+
+    log_s = np.log(scales[:len(fn)])
+    log_f = np.log(np.array(fn) + 1e-12)
+    try:
+        alpha, _ = np.polyfit(log_s, log_f, 1)
+        return float(alpha) if np.isfinite(alpha) else np.nan
+    except Exception:
+        return np.nan
 
 
-# ============================
-# HRV Backend (robusto)
-# ============================
+# ─────────────────────────────────────────
+# HRV core
+# ─────────────────────────────────────────
 
 def _hr_basic_from_rr(rr_ms: np.ndarray):
     rr = _finite_array(rr_ms)
@@ -229,29 +253,57 @@ def _hr_basic_from_rr(rr_ms: np.ndarray):
     return float(np.nanmean(hr)), float(np.nanmax(hr)), float(np.nanmin(hr))
 
 
+def rri_to_peaks(rri_ms: np.ndarray, sampling_rate=1000):
+    rri_ms = _finite_array(rri_ms)
+    if len(rri_ms) < 3:
+        return None
+    peak_times_s = np.cumsum(rri_ms) / 1000.0
+    peak_samples = np.unique(np.round(peak_times_s * sampling_rate).astype(int))
+    if len(peak_samples) < 3:
+        return None
+    length = int(peak_samples[-1] + sampling_rate)
+    peaks = np.zeros(length, dtype=int)
+    peaks[peak_samples] = 1
+    return peaks
+
+
+# Factor de corrección RMSSD por duración del test
+# Los valores normativos son para 5 min; tests más cortos tienden a sub-estimar RMSSD
+_DURATION_CORRECTION = {1: 1.22, 3: 1.08, 5: 1.00}
+
+
+def _duration_correction_factor(duration_minutes):
+    if duration_minutes is None:
+        return 1.0
+    try:
+        dm = float(duration_minutes)
+        if dm <= 1.5:
+            return _DURATION_CORRECTION[1]
+        if dm <= 4.0:
+            return _DURATION_CORRECTION[3]
+        return _DURATION_CORRECTION[5]
+    except Exception:
+        return 1.0
+
+
 def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
     rri_ms = _finite_array(rri_ms)
-
     if len(rri_ms) < 12:
         return {"error": "Insuficientes intervalos RR (mínimo recomendado: 12).", "artifact_percent": np.nan}
 
-    # 1) limpieza robusta tipo Kubios + salvataje
     rr_rescued, usable_ratio, art_global = _windowed_rr_salvage(rri_ms, window_beats=45, step_beats=20, max_artifact_pct=25.0)
-
-    # 2) además, clean_rri_ms (fisiológico + MAD) como segunda capa
     rr_clean, art_mad, _mask = clean_rri_ms(rr_rescued)
 
-    # artefact_percent final (mezcla conservadora)
-    if np.isfinite(art_global) and np.isfinite(art_mad):
-        artifact_percent = float(0.65 * art_global + 0.35 * art_mad)
-    elif np.isfinite(art_global):
-        artifact_percent = float(art_global)
-    else:
-        artifact_percent = float(art_mad) if np.isfinite(art_mad) else np.nan
+    artifact_percent = float(
+        0.65 * art_global + 0.35 * art_mad
+        if np.isfinite(art_global) and np.isfinite(art_mad)
+        else (art_global if np.isfinite(art_global) else (art_mad if np.isfinite(art_mad) else np.nan))
+    )
 
     hr_mean, hr_max, hr_min = _hr_basic_from_rr(rr_clean)
+    sd1, sd2, sd_ratio = compute_poincare(rr_clean)
+    dfa1 = compute_dfa_alpha1_approx(rr_clean)
 
-    # 3) HRV con NK2 (rri o fallback peaks)
     hrv_mode = "rri"
     try:
         hrv_time = nk.hrv_time(rri=rr_clean, show=False)
@@ -271,33 +323,34 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
             return np.nan
 
     rmssd = g(hrv_time, "HRV_RMSSD")
-    sdnn = g(hrv_time, "HRV_SDNN")
+    sdnn  = g(hrv_time, "HRV_SDNN")
     pnn50 = g(hrv_time, "HRV_pNN50")
     mean_rr = g(hrv_time, "HRV_MeanNN")
-    lnrmssd = np.log(rmssd) if np.isfinite(rmssd) and rmssd > 0 else np.nan
 
-    lf = g(hrv_freq, "HRV_LF")
-    hf = g(hrv_freq, "HRV_HF")
-    tp = g(hrv_freq, "HRV_TP")
-    lfhf = (lf / hf) if np.isfinite(lf) and np.isfinite(hf) and hf > 0 else np.nan
+    # Aplicar corrección por duración
+    corr = _duration_correction_factor(duration_minutes)
+    rmssd_corr = rmssd * corr if np.isfinite(rmssd) else np.nan
+
+    lnrmssd = np.log(rmssd_corr) if np.isfinite(rmssd_corr) and rmssd_corr > 0 else np.nan
+
+    lf  = g(hrv_freq, "HRV_LF")
+    hf  = g(hrv_freq, "HRV_HF")
+    tp  = g(hrv_freq, "HRV_TP")
+    lfhf = (lf / hf) if (np.isfinite(lf) and np.isfinite(hf) and hf > 0) else np.nan
 
     freq_warning = None
     if duration_minutes is not None:
         try:
-            dm = float(duration_minutes)
-            if dm < 5:
-                freq_warning = "Segmento < 5 min: LF/HF y potencia espectral pueden ser menos estables."
+            if float(duration_minutes) < 5:
+                freq_warning = "Test < 5 min: LF/HF y potencia espectral son orientativos."
         except Exception:
             pass
 
-    # 4) quality_score (0-100) y usable_ratio (0-1)
-    # cuanto menos artefacto, más score; usable_ratio rescate real de tramos
-    quality_score = np.nan
-    if np.isfinite(artifact_percent):
-        quality_score = float(np.clip(100.0 - artifact_percent, 0.0, 100.0))
+    quality_score = float(np.clip(100.0 - artifact_percent, 0.0, 100.0)) if np.isfinite(artifact_percent) else np.nan
 
     return {
         "rmssd": rmssd,
+        "rmssd_corr": rmssd_corr,
         "sdnn": sdnn,
         "lnrmssd": lnrmssd,
         "pnn50": pnn50,
@@ -306,6 +359,10 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
         "hf_power": hf,
         "lf_hf": lfhf,
         "total_power": tp,
+        "sd1": sd1,
+        "sd2": sd2,
+        "sd1_sd2_ratio": sd_ratio,
+        "dfa_alpha1": dfa1,
         "artifact_percent": artifact_percent,
         "usable_ratio": float(usable_ratio) if np.isfinite(usable_ratio) else None,
         "quality_score": quality_score,
@@ -314,28 +371,24 @@ def compute_hrv_from_rri(rri_ms: np.ndarray, duration_minutes=None):
         "hr_max": hr_max,
         "hr_min": hr_min,
         "freq_warning": freq_warning,
-        "hrv_mode": hrv_mode
+        "hrv_mode": hrv_mode,
+        "duration_correction": corr,
     }
 
 
 def _resp_rate_from_ppg_fft(ppg: np.ndarray, sampling_rate: float):
     try:
         rsp = nk.signal_filter(ppg, sampling_rate=sampling_rate, lowcut=0.1, highcut=0.4,
-                              method="butterworth", order=3)
-        rsp = np.asarray(rsp, dtype=float)
-        rsp = rsp - np.nanmean(rsp)
-
+                               method="butterworth", order=3)
+        rsp = np.asarray(rsp, dtype=float) - np.nanmean(rsp)
         n = len(rsp)
         if n < int(sampling_rate * 60):
             return np.nan
-
         freqs = np.fft.rfftfreq(n, d=1.0 / sampling_rate)
         spec = np.abs(np.fft.rfft(rsp)) ** 2
-
         mask = (freqs >= 0.1) & (freqs <= 0.4)
         if not np.any(mask):
             return np.nan
-
         f0 = freqs[mask][int(np.argmax(spec[mask]))]
         rpm = float(f0 * 60.0)
         return rpm if np.isfinite(rpm) else np.nan
@@ -344,17 +397,11 @@ def _resp_rate_from_ppg_fft(ppg: np.ndarray, sampling_rate: float):
 
 
 def _ppg_peaks_robust(ppg_f: np.ndarray, sampling_rate: float):
-    """
-    Picos robustos:
-    - intenta NK2 elgendi
-    - si falla o da pocos picos, fallback a find_peaks con prominencia adaptativa
-    """
     p = np.asarray(ppg_f, dtype=float)
     n = p.size
     if n < int(sampling_rate * 10):
         return None
 
-    # 1) intento NK2
     try:
         _peaks, info = nk.ppg_peaks(p, sampling_rate=sampling_rate, method="elgendi")
         peaks_idx = info.get("PPG_Peaks", info.get("peaks", None))
@@ -366,33 +413,18 @@ def _ppg_peaks_robust(ppg_f: np.ndarray, sampling_rate: float):
     except Exception:
         pass
 
-    # 2) fallback scipy.find_peaks con parámetros fisiológicos
-    # HR 40–180 -> RR 333–1500ms
-    min_dist = int((0.33) * sampling_rate)  # 333 ms
-    min_dist = max(1, min_dist)
-
-    # prominencia adaptativa por percentiles (evita detección por ruido)
+    min_dist = max(1, int(0.33 * sampling_rate))
     amp = np.percentile(p, 95) - np.percentile(p, 5)
-    prom = max(0.10, 0.15 * amp)  # conservador
-
+    prom = max(0.10, 0.15 * amp)
     peaks, _ = signal.find_peaks(p, distance=min_dist, prominence=prom)
     peaks = np.asarray(peaks, dtype=int)
     peaks = peaks[(peaks > 0) & (peaks < n)]
-    if peaks.size < 12:
-        return None
-    return peaks
+    return peaks if peaks.size >= 12 else None
 
 
 def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes=None):
-    """
-    HRV desde PPG (cámara):
-    - Filtrado tolerante (0.7–5.0 Hz) para evitar picos fantasmas
-    - Peaks robustos (NK2 + fallback find_peaks)
-    - RR -> limpieza Kubios-like + salvataje por ventanas
-    - HRV en NK2 con fallback
-    """
     ppg = _finite_array(ppg)
-    if sampling_rate is None or not np.isfinite(sampling_rate) or sampling_rate <= 1:
+    if not (np.isfinite(sampling_rate) and sampling_rate > 1):
         return {"error": "sampling_rate inválido."}
 
     min_seconds = 45
@@ -400,20 +432,11 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
         return {"error": f"PPG insuficiente (mínimo {min_seconds}s). Recomendado 3–5 min."}
 
     ppg = np.asarray(ppg, dtype=float)
-    ppg = ppg - np.nanmean(ppg)
-    std = np.nanstd(ppg) + 1e-9
-    ppg = ppg / std
+    ppg = (ppg - np.nanmean(ppg)) / (np.nanstd(ppg) + 1e-9)
 
-    # filtro más realista para HRV en PPG (reduce ruido alta frecuencia)
     try:
-        ppg_f = nk.signal_filter(
-            ppg,
-            sampling_rate=sampling_rate,
-            lowcut=0.7,
-            highcut=5.0,
-            method="butterworth",
-            order=3
-        )
+        ppg_f = nk.signal_filter(ppg, sampling_rate=sampling_rate, lowcut=0.7, highcut=5.0,
+                                 method="butterworth", order=3)
     except Exception:
         ppg_f = ppg
 
@@ -421,29 +444,24 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     if peaks_idx is None or len(peaks_idx) < 12:
         return {"error": "No se pudieron detectar picos PPG confiables (señal ruidosa o mal iluminada)."}
 
-    # RR (ms)
     rr_ms = np.diff(peaks_idx) / sampling_rate * 1000.0
     rr_ms = rr_ms[np.isfinite(rr_ms)]
     if len(rr_ms) < 12:
-        return {"error": "PPG con RR insuficientes (muy pocos intervalos)."}
+        return {"error": "PPG con RR insuficientes."}
 
-    # 1) salvataje tipo Kubios + ventanas
     rr_rescued, usable_ratio, art_global = _windowed_rr_salvage(rr_ms, window_beats=45, step_beats=20, max_artifact_pct=28.0)
-
-    # 2) segunda capa MAD fisiológico
     rr_clean, art_mad, _mask = clean_rri_ms(rr_rescued)
 
-    # artefactos final
-    if np.isfinite(art_global) and np.isfinite(art_mad):
-        artifact_final = float(0.65 * art_global + 0.35 * art_mad)
-    elif np.isfinite(art_global):
-        artifact_final = float(art_global)
-    else:
-        artifact_final = float(art_mad) if np.isfinite(art_mad) else np.nan
+    artifact_final = float(
+        0.65 * art_global + 0.35 * art_mad
+        if np.isfinite(art_global) and np.isfinite(art_mad)
+        else (art_global if np.isfinite(art_global) else (art_mad if np.isfinite(art_mad) else np.nan))
+    )
 
     hr_mean, hr_max, hr_min = _hr_basic_from_rr(rr_clean)
+    sd1, sd2, sd_ratio = compute_poincare(rr_clean)
+    dfa1 = compute_dfa_alpha1_approx(rr_clean)
 
-    # HRV con NK2 (rri fallback peaks)
     hrv_mode = "rri"
     try:
         hrv_time = nk.hrv_time(rri=rr_clean, show=False)
@@ -451,13 +469,13 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
     except Exception as e:
         peaks_bin = rri_to_peaks(rr_clean, sampling_rate=1000)
         if peaks_bin is None:
-            return {"error": f"Fallo calculando HRV desde RR (PPG): {str(e)}", "artifact_percent": artifact_final}
+            return {"error": f"Fallo HRV desde RR (PPG): {str(e)}", "artifact_percent": artifact_final}
         hrv_mode = "peaks"
         try:
             hrv_time = nk.hrv_time(peaks_bin, sampling_rate=1000, show=False)
             hrv_freq = nk.hrv_frequency(peaks_bin, sampling_rate=1000, show=False)
         except Exception as e2:
-            return {"error": f"Fallo calculando HRV desde peaks (PPG): {str(e2)}", "artifact_percent": artifact_final}
+            return {"error": f"Fallo HRV desde peaks (PPG): {str(e2)}", "artifact_percent": artifact_final}
 
     def g(df, key):
         try:
@@ -466,33 +484,34 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
             return np.nan
 
     rmssd = g(hrv_time, "HRV_RMSSD")
-    sdnn = g(hrv_time, "HRV_SDNN")
+    sdnn  = g(hrv_time, "HRV_SDNN")
     pnn50 = g(hrv_time, "HRV_pNN50")
     mean_rr = g(hrv_time, "HRV_MeanNN")
-    lnrmssd = np.log(rmssd) if np.isfinite(rmssd) and rmssd > 0 else np.nan
 
-    lf = g(hrv_freq, "HRV_LF")
-    hf = g(hrv_freq, "HRV_HF")
-    tp = g(hrv_freq, "HRV_TP")
-    lfhf = (lf / hf) if np.isfinite(lf) and np.isfinite(hf) and hf > 0 else np.nan
+    corr = _duration_correction_factor(duration_minutes)
+    rmssd_corr = rmssd * corr if np.isfinite(rmssd) else np.nan
+    lnrmssd = np.log(rmssd_corr) if np.isfinite(rmssd_corr) and rmssd_corr > 0 else np.nan
+
+    lf  = g(hrv_freq, "HRV_LF")
+    hf  = g(hrv_freq, "HRV_HF")
+    tp  = g(hrv_freq, "HRV_TP")
+    lfhf = (lf / hf) if (np.isfinite(lf) and np.isfinite(hf) and hf > 0) else np.nan
 
     resp_rpm = _resp_rate_from_ppg_fft(ppg_f, sampling_rate)
 
     freq_warning = None
     if duration_minutes is not None:
         try:
-            dm = float(duration_minutes)
-            if dm < 5:
-                freq_warning = "Segmento < 5 min: LF/HF y potencia espectral pueden ser menos estables."
+            if float(duration_minutes) < 5:
+                freq_warning = "Test < 5 min: LF/HF y potencia espectral son orientativos."
         except Exception:
             pass
 
-    quality_score = np.nan
-    if np.isfinite(artifact_final):
-        quality_score = float(np.clip(100.0 - artifact_final, 0.0, 100.0))
+    quality_score = float(np.clip(100.0 - artifact_final, 0.0, 100.0)) if np.isfinite(artifact_final) else np.nan
 
     return {
         "rmssd": rmssd,
+        "rmssd_corr": rmssd_corr,
         "sdnn": sdnn,
         "lnrmssd": lnrmssd,
         "pnn50": pnn50,
@@ -501,6 +520,10 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
         "hf_power": hf,
         "lf_hf": lfhf,
         "total_power": tp,
+        "sd1": sd1,
+        "sd2": sd2,
+        "sd1_sd2_ratio": sd_ratio,
+        "dfa_alpha1": dfa1,
         "artifact_percent": artifact_final,
         "usable_ratio": float(usable_ratio) if np.isfinite(usable_ratio) else None,
         "quality_score": quality_score,
@@ -513,23 +536,24 @@ def compute_hrv_from_ppg(ppg: np.ndarray, sampling_rate: float, duration_minutes
         "freq_warning": freq_warning,
         "hrv_mode": hrv_mode,
         "n_rr": int(len(rr_clean)),
-        "n_peaks": int(len(peaks_idx))
+        "n_peaks": int(len(peaks_idx)),
+        "duration_correction": corr,
     }
 
 
-# ============================
-# HBA Dashboard (CUADROS + SEMÁFORO)  (TU CÓDIGO ORIGINAL - intacto)
-# ============================
+# ─────────────────────────────────────────
+# HBA Dashboard — semáforo y diagnóstico
+# ─────────────────────────────────────────
 
 def baevsky_index(nn_ms: np.ndarray):
     nn_ms = _finite_array(nn_ms)
-    if nn_ms.size < 50:
+    if nn_ms.size < 30:
         return np.nan
     hist, edges = np.histogram(nn_ms, bins=50)
     mode_idx = int(np.argmax(hist))
-    Mo = float((edges[mode_idx] + edges[mode_idx + 1]) / 2.0)  # ms
-    AMo = float(hist[mode_idx] / nn_ms.size * 100.0)           # %
-    MxDMn = float(np.max(nn_ms) - np.min(nn_ms))               # ms
+    Mo  = float((edges[mode_idx] + edges[mode_idx + 1]) / 2.0)
+    AMo = float(hist[mode_idx] / nn_ms.size * 100.0)
+    MxDMn = float(np.max(nn_ms) - np.min(nn_ms))
     if Mo <= 0 or MxDMn <= 0:
         return np.nan
     SI = AMo / (2.0 * (Mo / 1000.0) * (MxDMn / 1000.0))
@@ -549,11 +573,10 @@ def classify_hml(value, low, high):
 
 def rmssd_reference_by_age_sex(age, sex):
     a = _as_float(age)
-    s = (str(sex).upper().strip() if sex is not None else "X")
+    s = str(sex).upper().strip() if sex else "X"
 
     if not np.isfinite(a):
-        low, high = 25.0, 55.0
-        return low, high
+        return 25.0, 55.0
 
     a = int(a)
     if a < 20:
@@ -574,228 +597,392 @@ def rmssd_reference_by_age_sex(age, sex):
     return float(low), float(high)
 
 
-def autonomic_score_0_100(rmssd, lfhf, baevsky_si):
-    parts = []
-    r = _as_float(rmssd)
-    if np.isfinite(r):
-        x = np.clip((80.0 - r) / (80.0 - 15.0), 0.0, 1.0)
-        parts.append(x)
+# ─── Semáforo clínico de 4 niveles ───────────────────────────────────────────
+#
+# Nomenclatura: los nombres evocan el estado del SNA y tienen sentido clínico.
+#
+#   ÓPTIMO       → HRV alta, sistema autonómico flexible y resiliente
+#   FUNCIONAL    → HRV normal, leve activación simpática, bien compensado
+#   COMPROMETIDO → HRV baja, carga autonómica elevada, requiere atención
+#   CRÍTICO      → HRV muy baja o patológica, intervención prioritaria
+#
+# El corte entre niveles se calcula con la referencia normalizada por edad/sexo
+# y un score compuesto (auto_score 0-100 donde 100 = máxima carga autonómica).
+# ─────────────────────────────────────────────────────────────────────────────
 
-    lf = _as_float(lfhf)
-    if np.isfinite(lf):
-        x = np.clip((lf - 1.0) / (5.0 - 1.0), 0.0, 1.0)
-        parts.append(x)
-
-    si = _as_float(baevsky_si)
-    if np.isfinite(si):
-        x = np.clip((si - 50.0) / (500.0 - 50.0), 0.0, 1.0)
-        parts.append(x)
-
-    if not parts:
-        return np.nan
-    return float(np.mean(parts) * 100.0)
-
-
-def fatigue_scores_0_100(rmssd, sdnn, hr_mean):
-    rm = _as_float(rmssd)
-    sd = _as_float(sdnn)
-    hr = _as_float(hr_mean)
-
-    phys_parts = []
-    emo_parts = []
-
-    if np.isfinite(sd):
-        phys_parts.append(np.clip((80.0 - sd) / (80.0 - 20.0), 0.0, 1.0))
-    if np.isfinite(hr):
-        phys_parts.append(np.clip((hr - 55.0) / (95.0 - 55.0), 0.0, 1.0))
-
-    if np.isfinite(rm):
-        emo_parts.append(np.clip((60.0 - rm) / (60.0 - 15.0), 0.0, 1.0))
-    if np.isfinite(hr):
-        emo_parts.append(np.clip((hr - 55.0) / (95.0 - 55.0), 0.0, 1.0))
-
-    phys = float(np.mean(phys_parts) * 100.0) if phys_parts else np.nan
-    emo = float(np.mean(emo_parts) * 100.0) if emo_parts else np.nan
-    return phys, emo
-
-
-def semaphore_plan(rmssd_state):
-    if rmssd_state == "bajo":
-        return {"color": "rojo", "plan": [
-            {"item": "Equilibrio SNA / patrón respiratorio / visualización", "pct": 60},
-            {"item": "Tejido miofascial (40% tensión e intensidad)", "pct": 40},
-            {"item": "Ejercicios de columna", "pct": 20},
-            {"item": "Ejercicio biomecánico funcional", "pct": 10},
-            {"item": "Relax", "pct": 10},
-        ]}
-    if rmssd_state == "medio":
-        return {"color": "amarillo", "plan": [
-            {"item": "Equilibrio SNA", "pct": 40},
-            {"item": "Tejido miofascial (60% tensión e intensidad)", "pct": 60},
-            {"item": "Ejercicios de columna", "pct": 20},
-            {"item": "Ejercicios biomecánicos funcionales", "pct": 30},
-            {"item": "Relax", "pct": 10},
-        ]}
-    if rmssd_state == "alto":
-        return {"color": "verde", "plan": [
-            {"item": "Equilibrio SNA", "pct": 30},
-            {"item": "Tejido miofascial (máxima tensión e intensidad)", "pct": 100},
+SEMAPHORE_LEVELS = {
+    "optimo": {
+        "label": "Óptimo",
+        "color": "#16a34a",       # verde oscuro clínico
+        "color_light": "#dcfce7",
+        "icon": "▲",
+        "description": "Sistema nervioso autónomo altamente flexible. Excelente capacidad de adaptación y recuperación.",
+        "plan": [
+            {"item": "Carga fascial y miofascial a máxima intensidad", "pct": 100},
+            {"item": "Ejercicios biomecánicos funcionales de alta demanda", "pct": 60},
+            {"item": "Ejercicios de columna con carga completa", "pct": 40},
+            {"item": "Equilibrio SNA (mantenimiento)", "pct": 20},
+            {"item": "Relax activo post-sesión", "pct": 10},
+        ]
+    },
+    "funcional": {
+        "label": "Funcional",
+        "color": "#2563eb",       # azul clínico
+        "color_light": "#dbeafe",
+        "icon": "●",
+        "description": "HRV dentro de rango normal. Leve activación simpática, sistema bien compensado.",
+        "plan": [
+            {"item": "Tejido miofascial (60–70% tensión e intensidad)", "pct": 70},
+            {"item": "Equilibrio SNA (respiración, coherencia)", "pct": 40},
             {"item": "Ejercicios biomecánicos funcionales", "pct": 40},
-            {"item": "Ejercicios de columna", "pct": 20},
-            {"item": "Relax", "pct": 10},
-        ]}
-    return {"color": "gris", "plan": []}
+            {"item": "Ejercicios de columna", "pct": 30},
+            {"item": "Relax post-sesión", "pct": 10},
+        ]
+    },
+    "comprometido": {
+        "label": "Comprometido",
+        "color": "#d97706",       # ámbar clínico
+        "color_light": "#fef3c7",
+        "icon": "▼",
+        "description": "HRV reducida. Carga autonómica elevada. Se recomienda priorizar recuperación y técnicas vagales.",
+        "plan": [
+            {"item": "Equilibrio SNA / patrón respiratorio / coherencia cardíaca", "pct": 60},
+            {"item": "Tejido miofascial (40% tensión, técnicas suaves)", "pct": 40},
+            {"item": "Ejercicios de columna (carga baja)", "pct": 20},
+            {"item": "Ejercicio biomecánico funcional adaptado", "pct": 20},
+            {"item": "Relax profundo", "pct": 20},
+        ]
+    },
+    "critico": {
+        "label": "Crítico",
+        "color": "#dc2626",       # rojo clínico
+        "color_light": "#fee2e2",
+        "icon": "⚠",
+        "description": "HRV muy baja o patológica. Intervención prioritaria. Derivar si persiste o hay síntomas asociados.",
+        "plan": [
+            {"item": "Equilibrio SNA intensivo (visualización, respiración 4-7-8)", "pct": 80},
+            {"item": "Tejido miofascial muy suave (sin carga)", "pct": 20},
+            {"item": "Movilidad articular pasiva", "pct": 15},
+            {"item": "Relax profundo / relajación progresiva", "pct": 30},
+            {"item": "Evaluación médica si persiste más de 48h", "pct": 0},
+        ]
+    },
+}
 
 
-def biomarker_meanings():
-    return [
-        {"biomarker": "HRV (RMSSD)", "meaning": "Variabilidad a corto plazo; asociada a modulación parasimpática (vagal) y recuperación."},
-        {"biomarker": "lnRMSSD", "meaning": "RMSSD en escala log; más estable para seguimiento."},
-        {"biomarker": "SDNN", "meaning": "Variabilidad global; refleja balance autonómico general."},
-        {"biomarker": "LF/HF", "meaning": "Indicador aproximado de balance simpático/parasimpático (muy sensible a respiración y duración)."},
-        {"biomarker": "Baevsky (SI)", "meaning": "Índice de estrés basado en distribución de RR; alto suele indicar mayor tensión autonómica."},
-        {"biomarker": "Score autonómico", "meaning": "Score compuesto (0–100) que resume carga autonómica con RMSSD + LF/HF + Baevsky."},
-        {"biomarker": "Fatiga física", "meaning": "Heurístico (0–100) combinando SDNN y FC media."},
-        {"biomarker": "Fatiga emocional", "meaning": "Heurístico (0–100) combinando RMSSD y FC media."},
-        {"biomarker": "Carga autonómica", "meaning": "Interpretación práctica del score autonómico (bajo/medio/alto)."},
-    ]
+def classify_semaphore(rmssd_corr, rmssd_low, rmssd_high, auto_score):
+    """
+    Determina el nivel del semáforo usando RMSSD corregido + score autonómico.
+    El score autonómico pondera la carga (0 = reposo total, 100 = máxima carga).
+    """
+    rmssd = _as_float(rmssd_corr)
+    score = _as_float(auto_score)
+
+    if not np.isfinite(rmssd):
+        return "funcional"   # sin datos suficientes, nivel conservador
+
+    # Umbrales extendidos sobre la referencia de edad/sexo
+    opt_threshold   = rmssd_high * 1.15  # 15% sobre el límite alto
+    crit_threshold  = rmssd_low  * 0.65  # 35% bajo el límite bajo
+
+    if rmssd >= opt_threshold or (np.isfinite(score) and score < 20):
+        return "optimo"
+    if rmssd < crit_threshold or (np.isfinite(score) and score > 75):
+        return "critico"
+    if rmssd >= rmssd_low:
+        return "funcional"
+    return "comprometido"
+
+
+# ─── Cargas diferenciadas ────────────────────────────────────────────────────
+#
+# Carga autonómica  → balance simpático/parasimpático (LF/HF + Baevsky + RMSSD)
+# Carga emocional   → tono vagal y capacidad de regulación emocional (RMSSD + pNN50 + SD1)
+# Carga física      → fatiga neuromuscular y metabólica (SDNN + HR media + DFA α1)
+# Estrés            → activación simpática aguda (Baevsky + LF/HF + HR vs mean_rr)
+#
+# Todos en escala 0-100 donde 0 = sin carga, 100 = máxima carga.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_cargas(rmssd, sdnn, pnn50, lf_hf, hr_mean, baevsky, sd1, dfa_alpha1):
+
+    def _part(val, lo, hi, invert=True):
+        """Normaliza val entre lo y hi. invert=True: más alto = más carga."""
+        v = _as_float(val)
+        if not np.isfinite(v):
+            return None
+        norm = np.clip((v - lo) / (hi - lo + 1e-9), 0, 1)
+        return float(norm if not invert else 1 - norm)
+
+    # ── Carga autonómica ──────────────────────────────────────────────────
+    ca_parts = []
+    p = _part(rmssd, 15, 80, invert=True)
+    if p is not None: ca_parts.append(p * 0.40)
+
+    p_lf = _as_float(lf_hf)
+    if np.isfinite(p_lf):
+        ca_parts.append(float(np.clip((p_lf - 1.0) / (5.0 - 1.0), 0, 1)) * 0.35)
+
+    p_si = _as_float(baevsky)
+    if np.isfinite(p_si):
+        ca_parts.append(float(np.clip((p_si - 50) / (500 - 50), 0, 1)) * 0.25)
+
+    carga_autonomica = float(np.sum(ca_parts) / max(sum([
+        0.40 if _as_float(rmssd) is not None and np.isfinite(_as_float(rmssd)) else 0,
+        0.35 if np.isfinite(_as_float(lf_hf)) else 0,
+        0.25 if np.isfinite(_as_float(baevsky)) else 0,
+    ]), 1e-9) * 100) if ca_parts else np.nan
+
+    # ── Carga emocional ───────────────────────────────────────────────────
+    # Eje vagal: RMSSD (corto plazo), pNN50 (frecuencia de variación rápida), SD1 (Poincaré corto)
+    ce_parts = []
+    w_total = 0
+    for val, lo, hi, w in [
+        (rmssd, 15, 70,  0.45),
+        (pnn50,  2, 40,  0.30),
+        (sd1,    8, 50,  0.25),
+    ]:
+        v = _as_float(val)
+        if np.isfinite(v):
+            ce_parts.append(float(np.clip(1 - (v - lo) / (hi - lo + 1e-9), 0, 1)) * w)
+            w_total += w
+
+    carga_emocional = float(np.sum(ce_parts) / max(w_total, 1e-9) * 100) if ce_parts else np.nan
+
+    # ── Carga física ──────────────────────────────────────────────────────
+    # SDNN refleja variabilidad global (fatiga la reduce), HR media sube con esfuerzo,
+    # DFA α1 < 0.75 indica desregulación por fatiga neuromuscular acumulada.
+    cf_parts = []
+    w_total = 0
+    for val, lo, hi, inv, w in [
+        (sdnn,       20,  80, True,  0.40),
+        (hr_mean,    55,  95, False, 0.35),
+        (dfa_alpha1, 0.5, 1.5, True, 0.25),
+    ]:
+        v = _as_float(val)
+        if np.isfinite(v):
+            norm = np.clip((v - lo) / (hi - lo + 1e-9), 0, 1)
+            cf_parts.append(float(norm if not inv else 1 - norm) * w)
+            w_total += w
+
+    carga_fisica = float(np.sum(cf_parts) / max(w_total, 1e-9) * 100) if cf_parts else np.nan
+
+    # ── Estrés ────────────────────────────────────────────────────────────
+    # Activación simpática aguda: Baevsky (el más directo), LF/HF, HR vs RR esperado
+    es_parts = []
+    w_total = 0
+    for val, lo, hi, w in [
+        (baevsky, 50,  500, 0.50),
+        (lf_hf,   1.0, 5.0, 0.30),
+        (hr_mean, 55,  95,  0.20),
+    ]:
+        v = _as_float(val)
+        if np.isfinite(v):
+            es_parts.append(float(np.clip((v - lo) / (hi - lo + 1e-9), 0, 1)) * w)
+            w_total += w
+
+    estres = float(np.sum(es_parts) / max(w_total, 1e-9) * 100) if es_parts else np.nan
+
+    def _level(score):
+        if not np.isfinite(score):
+            return "insuficiente"
+        if score < 30: return "bajo"
+        if score < 60: return "moderado"
+        if score < 80: return "alto"
+        return "muy alto"
+
+    return {
+        "carga_autonomica":  {"value": carga_autonomica,  "level": _level(carga_autonomica)},
+        "carga_emocional":   {"value": carga_emocional,   "level": _level(carga_emocional)},
+        "carga_fisica":      {"value": carga_fisica,       "level": _level(carga_fisica)},
+        "estres":            {"value": estres,             "level": _level(estres)},
+    }
 
 
 def enrich_hba_dashboard(result: dict, payload: dict):
     if result.get("error"):
         return result
 
-    age = payload.get("age", None)
-    sex = payload.get("sex", None)
+    age  = payload.get("age", None)
+    sex  = payload.get("sex", None)
 
-    rmssd = _as_float(result.get("rmssd"))
-    sdnn = _as_float(result.get("sdnn"))
-    lnrmssd = _as_float(result.get("lnrmssd"))
-    lfhf = _as_float(result.get("lf_hf"))
-    hr_mean = _as_float(result.get("hr_mean"))
+    rmssd      = _as_float(result.get("rmssd"))
+    rmssd_corr = _as_float(result.get("rmssd_corr", result.get("rmssd")))
+    sdnn       = _as_float(result.get("sdnn"))
+    lnrmssd    = _as_float(result.get("lnrmssd"))
+    pnn50      = _as_float(result.get("pnn50"))
+    lfhf       = _as_float(result.get("lf_hf"))
+    hr_mean    = _as_float(result.get("hr_mean"))
+    sd1        = _as_float(result.get("sd1"))
+    sd2        = _as_float(result.get("sd2"))
+    dfa1       = _as_float(result.get("dfa_alpha1"))
 
+    # Baevsky — calculado para cualquier sensor que tenga RR
     baevsky = np.nan
+    rri_source = []
 
-    if str(result.get("sensor_type", "")).strip() == "polar_h10":
-        rri_ms = payload.get("rri_ms", [])
-        if isinstance(rri_ms, list) and len(rri_ms) >= 12:
-            rr = _finite_array(np.array(rri_ms, dtype=float))
-            rr_clean, _ap, _mask = clean_rri_ms(rr)
-            baevsky = baevsky_index(rr_clean)
+    sensor = str(result.get("sensor_type", "")).strip()
+    if sensor in ("polar_h10", "rr_upload"):
+        rri_raw = payload.get("rri_ms", [])
+        if isinstance(rri_raw, list) and len(rri_raw) >= 12:
+            rri_source = rri_raw
+    elif sensor == "camera_ppg":
+        # reconstruir RR desde peaks si disponible, sino saltar
+        pass
 
-    if str(result.get("sensor_type", "")).strip() == "camera_ppg":
-        ppg = payload.get("ppg", [])
-        sr = _as_float(payload.get("sampling_rate", result.get("sampling_rate", 30)))
-        try:
-            ppg_arr = _finite_array(np.array(ppg, dtype=float))
-            if ppg_arr.size > 0 and np.isfinite(sr) and sr > 1:
-                p = ppg_arr - np.nanmean(ppg_arr)
-                p = p / (np.nanstd(p) + 1e-9)
-                try:
-                    p = nk.signal_filter(p, sampling_rate=sr, lowcut=0.7, highcut=5.0,
-                                         method="butterworth", order=3)
-                except Exception:
-                    pass
-                peaks_idx = _ppg_peaks_robust(p, sr)
-                if peaks_idx is not None and len(peaks_idx) >= 12:
-                    rr_ms = np.diff(peaks_idx) / sr * 1000.0
-                    rr_clean, _ap, _mask = clean_rri_ms(rr_ms)
-                    baevsky = baevsky_index(rr_clean)
-        except Exception:
-            pass
+    if rri_source:
+        rr = _finite_array(np.array(rri_source, dtype=float))
+        rr_clean, _ap, _mask = clean_rri_ms(rr)
+        baevsky = baevsky_index(rr_clean)
 
     rm_low, rm_high = rmssd_reference_by_age_sex(age, sex)
-    rm_state = classify_hml(rmssd, rm_low, rm_high)
+    rm_state = classify_hml(rmssd_corr, rm_low, rm_high)
 
-    auto_score = autonomic_score_0_100(rmssd, lfhf, baevsky)
-    load_state = classify_hml(auto_score, 35.0, 65.0)
+    cargas = compute_cargas(rmssd_corr, sdnn, pnn50, lfhf, hr_mean, baevsky, sd1, dfa1)
+    ca_score = cargas["carga_autonomica"]["value"]
 
-    baev_state = classify_hml(baevsky, 150.0, 300.0)
-
-    fat_phys, fat_emo = fatigue_scores_0_100(rmssd, sdnn, hr_mean)
-    fat_phys_state = classify_hml(fat_phys, 35.0, 65.0)
-    fat_emo_state = classify_hml(fat_emo, 35.0, 65.0)
-
-    sem = semaphore_plan(rm_state)
+    sem_key  = classify_semaphore(rmssd_corr, rm_low, rm_high, ca_score)
+    sem_data = SEMAPHORE_LEVELS[sem_key]
 
     biomarkers = [
-        {"name": "HRV (RMSSD)", "value": rmssd, "unit": "ms", "state": rm_state,
-         "detail": f"Ref edad/sexo: bajo<{rm_low:.0f} / alto>{rm_high:.0f}"},
-        {"name": "lnRMSSD", "value": lnrmssd, "unit": "", "state": "informativo", "detail": ""},
-        {"name": "SDNN", "value": sdnn, "unit": "ms", "state": classify_hml(sdnn, 30.0, 60.0), "detail": ""},
-        {"name": "FC media", "value": hr_mean, "unit": "bpm", "state": classify_hml(hr_mean, 60.0, 85.0), "detail": ""},
-        {"name": "LF/HF", "value": lfhf, "unit": "", "state": classify_hml(lfhf, 1.5, 3.0), "detail": result.get("freq_warning") or ""},
-        {"name": "Índice de estrés Baevsky", "value": baevsky, "unit": "", "state": baev_state, "detail": ""},
-        {"name": "Score autonómico", "value": auto_score, "unit": "/100", "state": load_state, "detail": "Más alto = más carga autonómica"},
-        {"name": "Carga autonómica", "value": auto_score, "unit": "/100", "state": load_state, "detail": ""},
-        {"name": "Estrés", "value": auto_score, "unit": "/100", "state": load_state, "detail": ""},
-        {"name": "Fatiga física", "value": fat_phys, "unit": "/100", "state": fat_phys_state, "detail": ""},
-        {"name": "Fatiga emocional", "value": fat_emo, "unit": "/100", "state": fat_emo_state, "detail": ""},
+        {
+            "name": "HRV — RMSSD",
+            "value": rmssd,
+            "value_corr": rmssd_corr,
+            "unit": "ms",
+            "state": rm_state,
+            "detail": f"Ref edad/sexo: bajo < {rm_low:.0f} / alto > {rm_high:.0f} ms"
+        },
+        {
+            "name": "lnRMSSD",
+            "value": lnrmssd,
+            "unit": "",
+            "state": "informativo",
+            "detail": "Logaritmo natural del RMSSD corregido"
+        },
+        {
+            "name": "SDNN",
+            "value": sdnn,
+            "unit": "ms",
+            "state": classify_hml(sdnn, 30.0, 60.0),
+            "detail": "Variabilidad global"
+        },
+        {
+            "name": "FC media",
+            "value": hr_mean,
+            "unit": "bpm",
+            "state": classify_hml(hr_mean, 60.0, 85.0),
+            "detail": ""
+        },
+        {
+            "name": "LF/HF",
+            "value": lfhf,
+            "unit": "",
+            "state": classify_hml(lfhf, 1.5, 3.0),
+            "detail": result.get("freq_warning") or ""
+        },
+        {
+            "name": "Índice de Baevsky (SI)",
+            "value": baevsky,
+            "unit": "",
+            "state": classify_hml(baevsky, 150.0, 300.0),
+            "detail": "Alto SI = mayor tensión autonómica"
+        },
+        {
+            "name": "SD1 (Poincaré)",
+            "value": sd1,
+            "unit": "ms",
+            "state": classify_hml(sd1, 10.0, 50.0),
+            "detail": "Variabilidad latido a latido (vagal)"
+        },
+        {
+            "name": "SD2 (Poincaré)",
+            "value": sd2,
+            "unit": "ms",
+            "state": classify_hml(sd2, 20.0, 80.0),
+            "detail": "Variabilidad a largo plazo"
+        },
+        {
+            "name": "DFA α1",
+            "value": dfa1,
+            "unit": "",
+            "state": classify_hml(dfa1, 0.75, 1.5),
+            "detail": "< 0.75 indica desregulación autonómica"
+        },
     ]
 
     result["hba_dashboard"] = {
         "biomarkers": biomarkers,
-        "interpretation": biomarker_meanings(),
-        "norms": {"age": age, "sex": sex, "rmssd_low": rm_low, "rmssd_high": rm_high, "rmssd_state": rm_state},
-        "semaphore": sem,
-        "differentiator": {
-            "what_distinguishes": "Semáforo HBA: traduce tu HRV (RMSSD por edad/sexo) en un plan porcentual de intervención (SNA / miofascial / columna / biomecánico / relax)."
+        "cargas": cargas,
+        "norms": {
+            "age": age,
+            "sex": sex,
+            "rmssd_low": rm_low,
+            "rmssd_high": rm_high,
+            "rmssd_state": rm_state,
+        },
+        "semaphore": {
+            "key": sem_key,
+            "label": sem_data["label"],
+            "color": sem_data["color"],
+            "color_light": sem_data["color_light"],
+            "icon": sem_data["icon"],
+            "description": sem_data["description"],
+            "plan": sem_data["plan"],
         },
     }
     return result
 
 
-# ============================
-# Persistencia CSV
-# ============================
+# ─────────────────────────────────────────
+# Persistencia — Supabase o CSV fallback
+# ─────────────────────────────────────────
 
-CSV_COLUMNS = [
-    "timestamp_utc",
-    "student_id",
-    "age",
-    "comorbidities",
-    "sensor_type",
-    "duration_minutes",
-    "rmssd",
-    "sdnn",
-    "lnrmssd",
-    "pnn50",
-    "mean_rr",
-    "lf_power",
-    "hf_power",
-    "lf_hf",
-    "total_power",
-    "artifact_percent",
-    "quality_score",
-    "usable_ratio",
-    "hr_mean",
-    "hr_max",
-    "hr_min",
-    "resp_rate_rpm",
-    "freq_warning",
-    "notes",
+DB_COLUMNS = [
+    "timestamp_utc", "patient_id", "age", "sex", "comorbidities",
+    "sensor_type", "duration_minutes",
+    "rmssd", "rmssd_corr", "sdnn", "lnrmssd", "pnn50", "mean_rr",
+    "lf_power", "hf_power", "lf_hf", "total_power",
+    "sd1", "sd2", "sd1_sd2_ratio", "dfa_alpha1",
+    "artifact_percent", "quality_score", "usable_ratio",
+    "hr_mean", "hr_max", "hr_min", "resp_rate_rpm",
+    "carga_autonomica", "carga_emocional", "carga_fisica", "estres",
+    "semaphore_key", "semaphore_label",
+    "baevsky", "freq_warning", "notes",
 ]
 
 
-def append_to_dataset(row: dict):
-    df_row = pd.DataFrame([{c: row.get(c, "") for c in CSV_COLUMNS}])
+def save_session(row: dict):
+    sb = get_supabase()
+    if sb:
+        try:
+            sb.table(SUPABASE_TABLE).insert(row).execute()
+            return {"backend": "supabase", "ok": True}
+        except Exception as e:
+            # Fallback a CSV si Supabase falla
+            _csv_append(row)
+            return {"backend": "csv_fallback", "ok": True, "warning": str(e)}
+    else:
+        _csv_append(row)
+        return {"backend": "csv_local", "ok": True}
 
-    if os.path.exists(DATASET_FILE):
-        df = pd.read_csv(DATASET_FILE)
-        for c in CSV_COLUMNS:
+
+def _csv_append(row: dict):
+    df_row = pd.DataFrame([{c: row.get(c, "") for c in DB_COLUMNS}])
+    if os.path.exists(CSV_FALLBACK):
+        df = pd.read_csv(CSV_FALLBACK)
+        for c in DB_COLUMNS:
             if c not in df.columns:
                 df[c] = ""
-        df = df[CSV_COLUMNS]
-        df = pd.concat([df, df_row], ignore_index=True)
+        df = pd.concat([df[DB_COLUMNS], df_row], ignore_index=True)
     else:
         df = df_row
+    df.to_csv(CSV_FALLBACK, index=False)
 
-    df.to_csv(DATASET_FILE, index=False)
 
-
-# ============================
-# Flask
-# ============================
+# ─────────────────────────────────────────
+# Flask routes
+# ─────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -805,8 +992,7 @@ def index():
 @app.route("/api/compute", methods=["POST"])
 def api_compute():
     payload = request.get_json(force=True) or {}
-
-    sensor_type = str(payload.get("sensor_type", "")).strip()
+    sensor_type      = str(payload.get("sensor_type", "")).strip()
     duration_minutes = payload.get("duration_minutes", None)
 
     if sensor_type == "polar_h10":
@@ -826,49 +1012,99 @@ def api_compute():
         result = enrich_hba_dashboard(result, payload)
         return jsonify(_sanitize_for_json(result))
 
-    return jsonify(_sanitize_for_json({"error": "sensor_type inválido. Use 'camera_ppg' o 'polar_h10'."})), 400
+    if sensor_type == "rr_upload":
+        rri_ms = payload.get("rri_ms", [])
+        result = compute_hrv_from_rri(np.array(rri_ms, dtype=float), duration_minutes=duration_minutes)
+        result["sensor_type"] = "rr_upload"
+        result["duration_minutes"] = duration_minutes
+        result = enrich_hba_dashboard(result, payload)
+        return jsonify(_sanitize_for_json(result))
+
+    return jsonify(_sanitize_for_json({
+        "error": "sensor_type inválido. Use 'camera_ppg', 'polar_h10' o 'rr_upload'."
+    })), 400
 
 
 @app.route("/api/save", methods=["POST"])
 def api_save():
-    payload = request.get_json(force=True) or {}
-
-    student_id = str(payload.get("student_id", "")).strip()
-    age = payload.get("age", "")
-    comorbidities = str(payload.get("comorbidities", "")).strip()
-    notes = str(payload.get("notes", "")).strip()
-
-    metrics = payload.get("metrics", {}) or {}
+    payload  = request.get_json(force=True) or {}
+    metrics  = payload.get("metrics", {}) or {}
+    dash     = metrics.get("hba_dashboard", {}) or {}
+    cargas   = dash.get("cargas", {}) or {}
+    sem      = dash.get("semaphore", {}) or {}
 
     row = {
-        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
-        "student_id": student_id,
-        "age": age,
-        "comorbidities": comorbidities,
-        "sensor_type": metrics.get("sensor_type", ""),
+        "timestamp_utc":    datetime.now(timezone.utc).isoformat(),
+        "patient_id":       str(payload.get("patient_id", "")).strip(),
+        "age":              payload.get("age", ""),
+        "sex":              str(payload.get("sex", "")).strip().upper(),
+        "comorbidities":    str(payload.get("comorbidities", "")).strip(),
+        "notes":            str(payload.get("notes", "")).strip(),
+        "sensor_type":      metrics.get("sensor_type", ""),
         "duration_minutes": metrics.get("duration_minutes", ""),
-        "rmssd": metrics.get("rmssd", ""),
-        "sdnn": metrics.get("sdnn", ""),
-        "lnrmssd": metrics.get("lnrmssd", ""),
-        "pnn50": metrics.get("pnn50", ""),
-        "mean_rr": metrics.get("mean_rr", ""),
-        "lf_power": metrics.get("lf_power", ""),
-        "hf_power": metrics.get("hf_power", ""),
-        "lf_hf": metrics.get("lf_hf", ""),
-        "total_power": metrics.get("total_power", ""),
+        "rmssd":            metrics.get("rmssd", ""),
+        "rmssd_corr":       metrics.get("rmssd_corr", ""),
+        "sdnn":             metrics.get("sdnn", ""),
+        "lnrmssd":          metrics.get("lnrmssd", ""),
+        "pnn50":            metrics.get("pnn50", ""),
+        "mean_rr":          metrics.get("mean_rr", ""),
+        "lf_power":         metrics.get("lf_power", ""),
+        "hf_power":         metrics.get("hf_power", ""),
+        "lf_hf":            metrics.get("lf_hf", ""),
+        "total_power":      metrics.get("total_power", ""),
+        "sd1":              metrics.get("sd1", ""),
+        "sd2":              metrics.get("sd2", ""),
+        "sd1_sd2_ratio":    metrics.get("sd1_sd2_ratio", ""),
+        "dfa_alpha1":       metrics.get("dfa_alpha1", ""),
         "artifact_percent": metrics.get("artifact_percent", ""),
-        "quality_score": metrics.get("quality_score", ""),
-        "usable_ratio": metrics.get("usable_ratio", ""),
-        "hr_mean": metrics.get("hr_mean", ""),
-        "hr_max": metrics.get("hr_max", ""),
-        "hr_min": metrics.get("hr_min", ""),
-        "resp_rate_rpm": metrics.get("resp_rate_rpm", ""),
-        "freq_warning": metrics.get("freq_warning", ""),
-        "notes": notes,
+        "quality_score":    metrics.get("quality_score", ""),
+        "usable_ratio":     metrics.get("usable_ratio", ""),
+        "hr_mean":          metrics.get("hr_mean", ""),
+        "hr_max":           metrics.get("hr_max", ""),
+        "hr_min":           metrics.get("hr_min", ""),
+        "resp_rate_rpm":    metrics.get("resp_rate_rpm", ""),
+        "carga_autonomica": cargas.get("carga_autonomica", {}).get("value", ""),
+        "carga_emocional":  cargas.get("carga_emocional",  {}).get("value", ""),
+        "carga_fisica":     cargas.get("carga_fisica",     {}).get("value", ""),
+        "estres":           cargas.get("estres",           {}).get("value", ""),
+        "semaphore_key":    sem.get("key", ""),
+        "semaphore_label":  sem.get("label", ""),
+        "baevsky":          next(
+            (b.get("value") for b in (dash.get("biomarkers") or []) if "Baevsky" in b.get("name", "")),
+            ""
+        ),
+        "freq_warning":     metrics.get("freq_warning", ""),
     }
 
-    append_to_dataset(row)
-    return jsonify({"ok": True, "file": DATASET_FILE})
+    save_result = save_session(row)
+    return jsonify({"ok": True, **save_result})
+
+
+@app.route("/api/history", methods=["GET"])
+def api_history():
+    """Devuelve las últimas 100 sesiones del paciente (por patient_id)."""
+    patient_id = request.args.get("patient_id", "").strip()
+    if not patient_id:
+        return jsonify({"error": "patient_id requerido"}), 400
+
+    sb = get_supabase()
+    if sb:
+        try:
+            res = (sb.table(SUPABASE_TABLE)
+                   .select("*")
+                   .eq("patient_id", patient_id)
+                   .order("timestamp_utc", desc=True)
+                   .limit(100)
+                   .execute())
+            return jsonify({"data": res.data or []})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    else:
+        if os.path.exists(CSV_FALLBACK):
+            df = pd.read_csv(CSV_FALLBACK)
+            df = df[df["patient_id"] == patient_id].tail(100)
+            return jsonify({"data": df.to_dict(orient="records")})
+        return jsonify({"data": []})
 
 
 if __name__ == "__main__":
